@@ -1,224 +1,183 @@
-// Dashboard: business hub + today's figures and trends, all computed from transaction records.
-import * as idb from '../db/idb.js';
+// Home screen: today at a glance — gas tank, cylinders, sales, dues and low-stock alerts.
+import { read } from '../db/idb.js';
+import { esc, fmtNum, fmtQty, fmtTime, today, num, round2, fmtDate } from '../core/utils.js';
+import { getSettings, cylinderType } from '../core/settings.js';
+import { cylinderSvg, tankSvg, animateVisuals } from '../core/visuals.js';
 import * as UI from '../core/ui.js';
-import { esc, fmtNum, fmtQty, fmtTime, fmtDate, today, localDate, round2, debounce } from '../core/utils.js';
-import { cur } from '../core/views.js';
-import { pref } from '../core/settings.js';
 import * as Auth from '../services/auth.js';
-import * as Catalog from '../services/catalog.js';
-import * as Posting from '../services/posting.js';
-import * as Backup from '../services/backup.js';
+import { partyDues } from '../services/gas.js';
 
-const $ = window.jQuery;
+const cur = () => getSettings().currency;
+const money = (n) => `<span data-count="${round2(n)}" data-fmt="money">${esc(cur())} ${fmtNum(n)}</span>`;
 
-export async function todayFigures(date = today()) {
-  const r = IDBKeyRange.only(date);
-  const [sales, purchases, sret, pret, vouchers, entries, accounts] = await idb.read(['sales', 'purchases', 'saleReturns', 'purchaseReturns', 'vouchers', 'entries', 'accounts'], (t) => Promise.all([
-    t.getAllByIndex('sales', 'date', r), t.getAllByIndex('purchases', 'date', r), t.getAllByIndex('saleReturns', 'date', r),
-    t.getAllByIndex('purchaseReturns', 'date', r), t.getAllByIndex('vouchers', 'date', r), t.getAllByIndex('entries', 'date', r), t.getAll('accounts'),
-  ]));
-  const live = (x) => x.filter((d) => d.status !== 'void');
-  const cashIds = new Set(accounts.filter((a) => ['cash', 'bank'].includes(a.type)).map((a) => a.id));
-  const cashEntries = entries.filter((e) => cashIds.has(e.accountId) && e.refType !== 'opening' && e.refType !== 'transfer');
-  const s = live(sales); const p = live(purchases);
-  return {
-    sales: round2(s.reduce((a, d) => a + d.total, 0)), salesCount: s.length,
-    purchases: round2(p.reduce((a, d) => a + d.total, 0)), purchasesCount: p.length,
-    saleReturns: round2(live(sret).reduce((a, d) => a + d.total, 0)),
-    purchaseReturns: round2(live(pret).reduce((a, d) => a + d.total, 0)),
-    cashIn: round2(cashEntries.reduce((a, e) => a + e.debit, 0)),
-    cashOut: round2(cashEntries.reduce((a, e) => a + e.credit, 0)),
-    txCount: s.length + p.length + live(sret).length + live(pret).length + live(vouchers).length,
-    recent: s.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 6),
-    cashIds,
-  };
+function greeting() {
+  const h = new Date().getHours();
+  return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
 }
 
-// Sales per day for the last 7 days + top products by amount (from sale lines).
-async function weekFigures() {
-  const days = [];
-  for (let i = 6; i >= 0; i--) { const d = new Date(); d.setDate(d.getDate() - i); days.push(localDate(d)); }
-  const range = IDBKeyRange.bound(days[0], days[6]);
-  const [sales, items] = await idb.read(['sales', 'saleItems'], (t) => Promise.all([t.getAllByIndex('sales', 'date', range), t.getAllByIndex('saleItems', 'date', range)]));
-  const byDay = Object.fromEntries(days.map((d) => [d, { date: d, total: 0, count: 0 }]));
-  for (const s of sales) if (s.status !== 'void' && byDay[s.date]) { byDay[s.date].total += s.total; byDay[s.date].count++; }
-  const prod = new Map();
-  for (const i of items) { const x = prod.get(i.productId) || { name: i.name, amount: 0, qty: 0 }; x.amount += i.amount; x.qty += i.qty; prod.set(i.productId, x); }
-  return { days: days.map((d) => ({ ...byDay[d], total: round2(byDay[d].total) })), top: [...prod.values()].sort((a, b) => b.amount - a.amount).slice(0, 5) };
-}
+export async function render(el, { setTitle }) {
+  setTitle('Dashboard');
+  const s = getSettings();
+  const d = today();
 
-const compact = (n) => (Math.abs(n) >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : Math.abs(n) >= 1e3 ? `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1)}k` : String(Math.round(n)));
-function niceMax(v) {
-  if (v <= 0) return 1;
-  const p = 10 ** Math.floor(Math.log10(v));
-  const m = v / p;
-  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p;
-}
+  const snap = await read(['meta', 'cylStock', 'items', 'bills', 'customers', 'suppliers'], async (t) => ({
+    gasKg: num((await t.get('meta', 'gasKg'))?.value),
+    cyl: await t.getAll('cylStock'),
+    items: await t.getAll('items'),
+    bills: await t.getAll('bills'),
+    customers: await t.getAll('customers'),
+    suppliers: await t.getAll('suppliers'),
+  }));
+  const dues = await partyDues();
 
-// Single-series bar chart drawn at the container's real width (so text stays crisp). Hover/tap shows a tooltip.
-function drawWeekChart(box, days) {
-  const W = Math.max(280, box.clientWidth); const H = 190;
-  const m = { t: 22, r: 8, b: 26, l: 40 };
-  const iw = W - m.l - m.r; const ih = H - m.t - m.b;
-  const max = niceMax(Math.max(...days.map((d) => d.total)));
-  const band = iw / days.length; const bw = Math.min(36, band * 0.56);
-  const y = (v) => m.t + ih - (v / max) * ih;
-  const peak = days.reduce((a, d, i) => (d.total > days[a].total ? i : a), 0);
-  const ticks = [0, max / 2, max];
-  const barPath = (x, top, w, h) => {
-    if (h <= 0) return '';
-    const r = Math.min(4, h, w / 2);
-    return `M${x},${top + h} V${top + r} Q${x},${top} ${x + r},${top} H${x + w - r} Q${x + w},${top} ${x + w},${top + r} V${top + h} Z`;
-  };
-  let svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Sales for the last 7 days"><g class="grid">`;
-  for (const t of ticks) svg += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(t)}" y2="${y(t)}"/>`;
-  svg += '</g><g class="axis">';
-  for (const t of ticks) svg += `<text x="${m.l - 8}" y="${y(t) + 4}" text-anchor="end">${compact(t)}</text>`;
-  days.forEach((d, i) => {
-    const cx = m.l + band * i + band / 2;
-    const label = i === days.length - 1 ? 'Today' : new Date(d.date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' });
-    svg += `<text x="${cx}" y="${H - 6}" text-anchor="middle" ${i === days.length - 1 ? 'font-weight="700"' : ''}>${esc(label)}</text>`;
-  });
-  svg += '</g>';
-  days.forEach((d, i) => {
-    const x = m.l + band * i + (band - bw) / 2; const top = y(d.total); const h = m.t + ih - top;
-    svg += `<path class="bar" d="${barPath(x, top, bw, h)}" style="animation-delay:${i * 0.05}s"/>`;
-    if ((i === peak || i === days.length - 1) && d.total > 0) svg += `<text class="val" x="${x + bw / 2}" y="${top - 6}" text-anchor="middle">${compact(d.total)}</text>`;
-    svg += `<rect class="bar-hit" data-i="${i}" x="${m.l + band * i}" y="${m.t}" width="${band}" height="${ih}"/>`;
-  });
-  svg += '</svg><div class="viz-tip"></div>';
-  box.innerHTML = svg;
-  const tip = box.querySelector('.viz-tip');
-  const show = (el) => {
-    const d = days[+el.dataset.i];
-    tip.innerHTML = `<b>${esc(fmtDate(d.date))}</b><br>${esc(cur())} ${fmtNum(d.total)} · ${d.count} invoice${d.count === 1 ? '' : 's'}`;
-    tip.style.left = `${(+el.getAttribute('x') + band / 2)}px`;
-    tip.style.top = `${Math.max(14, y(d.total))}px`;
-    tip.classList.add('show');
-  };
-  box.querySelectorAll('.bar-hit').forEach((el) => {
-    el.addEventListener('mouseenter', () => show(el));
-    el.addEventListener('click', () => show(el));
-    el.addEventListener('mouseleave', () => tip.classList.remove('show'));
-  });
-}
+  const live = snap.bills.filter((b) => b.status !== 'void');
+  const todays = live.filter((b) => b.date === d);
+  const salesToday = round2(todays.reduce((a, b) => a + b.total, 0));
+  const cashToday = round2(todays.reduce((a, b) => a + b.paid, 0));
+  const kgToday = round2(todays.flatMap((b) => b.lines).filter((l) => l.kind === 'refill').reduce((a, l) => a + l.kg, 0));
+  const outToday = todays.flatMap((b) => b.lines).filter((l) => l.kind === 'cyl').reduce((a, l) => a + l.out, 0);
+  const inToday = todays.flatMap((b) => b.lines).filter((l) => l.kind === 'cyl').reduce((a, l) => a + l.in, 0);
+  const customerOwed = round2(snap.customers.reduce((a, c) => a + Math.max(0, dues.get(c.id) || 0), 0));
+  const supplierOwed = round2(snap.suppliers.reduce((a, c) => a + Math.max(0, dues.get(c.id) || 0), 0));
+  const lowStock = snap.items.filter((i) => num(i.minStock) > 0 && num(i.stock) <= num(i.minStock))
+    .sort((a, b) => a.stock - b.stock);
+  const recent = [...live].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')).slice(0, 5);
+  const cap = num(s.tankCapacityKg);
+  const tankPct = cap > 0 ? Math.min(1, snap.gasKg / cap) : 0;
+  const setupNeeded = !(s.gasRate > 0) || s.cylinderTypes.some((t) => !(t.price > 0));
+  const dateLabel = new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'short' });
 
-export default {
-  async render(el) {
-    this.destroy();
-    const $el = $(el);
-    const u = Auth.user();
-    const [f, bal, wk] = await Promise.all([todayFigures(), Posting.allBalances(), weekFigures()]);
-    let rec = 0; let pay = 0; let cash = 0;
-    for (const [id, b] of bal) {
-      if (id.startsWith('C:') && b.balance > 0) rec += b.balance;
-      if (id.startsWith('S:') && b.balance < 0) pay -= b.balance;
-      if (f.cashIds.has(id)) cash += b.balance;
-    }
-    const prods = Catalog.allProducts().filter((p) => p.active);
-    const tracked = prods.filter((p) => p.trackStock !== false);
-    const stockValue = tracked.reduce((s, p) => s + Math.max(0, p.stock) * (p.purchasePrice || 0), 0);
-    const low = tracked.filter((p) => p.stock <= (p.minStock || 0)).sort((a, b) => a.stock - b.stock);
-    const customers = Catalog.allParties('customers').filter((c) => c.active).length;
-    const suppliers = Catalog.allParties('suppliers').filter((c) => c.active).length;
-    const lastBackup = pref.get('lastBackupAt');
-    const backupDays = lastBackup ? Math.floor((Date.now() - new Date(lastBackup)) / 86400000) : null;
-    const hour = new Date().getHours();
-    const greet = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
-    const M = (n) => `data-count="${round2(n)}" data-money="1"`;
+  const cylCards = s.cylinderTypes.map((t) => {
+    const row = snap.cyl.find((c) => c.id === t.id) || { full: 0, empty: 0 };
+    const total = row.full + row.empty;
+    const tone = t.kg >= 15 ? 'water' : 'flame';
+    return `<div class="col-6 col-xl-4"><div class="cyl-card card-lift h-100">
+        <div class="cyl-name fw-semibold">${esc(t.name)}</div>
+        <div class="d-flex gap-2 align-items-center mt-1">
+          ${cylinderSvg(total ? row.full / total : 0, { tone, label: `${t.name}: ${row.full} full` })}
+          <div class="min-w-0">
+            <div class="cyl-count"><span class="fw-bold" data-count="${row.full}" data-fmt="int">0</span> <span class="small text-body-secondary">full</span></div>
+            <div class="small text-body-secondary">${row.empty} empty</div>
+          </div>
+        </div></div></div>`;
+  }).join('') || UI.emptyState('No cylinder types yet. Add them in Settings.', 'fuel-pump');
 
-    const tile = (href, icon, tint, title, sub, perm) => (perm && !Auth.can(perm) ? '' : `<div class="col-6 col-md-4 col-xl-3">
-      <a class="hub-tile" href="${href}"><div class="icon-chip tint-${tint}"><i class="bi bi-${icon}"></i></div>
-      <div class="min-w-0"><div class="t">${title}</div><div class="s">${sub}</div></div></a></div>`);
-    const kpi = (icon, tint, label, valueAttr, href) => `<div class="col-6 col-lg-3"><${href ? `a href="${href}"` : 'div'} class="stat-card card-body d-block text-decoration-none p-3 h-100">
-      <div class="kpi"><div class="icon-chip tint-${tint}"><i class="bi bi-${icon}"></i></div><div class="min-w-0"><div class="l">${label}</div><div class="v money" ${valueAttr}>0</div></div></div></${href ? 'a' : 'div'}></div>`;
-
-    $el.html(`
-      <div class="hero-card">
-        <div class="d-flex justify-content-between align-items-start gap-2 mb-3">
-          <div><div class="hello">${greet}, ${esc(u.name.split(' ')[0])}</div><div class="date">${new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</div></div>
-          <span class="pill"><i class="bi bi-${navigator.onLine ? 'cloud-check' : 'wifi-off'}"></i>${navigator.onLine ? 'Online' : 'Offline'}</span>
-        </div>
-        <div class="lbl">Today's sales</div>
-        <div class="big money" ${M(f.sales)}>0</div>
-        <div class="d-flex flex-wrap gap-2 mt-2 mb-3">
-          <span class="pill"><i class="bi bi-receipt"></i>${f.salesCount} invoice${f.salesCount === 1 ? '' : 's'}</span>
-          <span class="pill"><i class="bi bi-arrow-down-circle"></i>In ${esc(cur())} ${fmtNum(f.cashIn)}</span>
-          <span class="pill"><i class="bi bi-arrow-up-circle"></i>Out ${esc(cur())} ${fmtNum(f.cashOut)}</span>
-        </div>
-        <div class="d-flex flex-wrap gap-2">
-          ${Auth.can('sale.create') ? '<a class="btn hero-cta" href="#/pos"><i class="bi bi-cart-plus me-1"></i>New sale</a>' : ''}
-          ${Auth.can('purchase.manage') ? '<a class="btn btn-outline-light" href="#/purchase/new"><i class="bi bi-bag-plus me-1"></i>Purchase</a>' : ''}
-          ${Auth.can('voucher.create') ? '<a class="btn btn-outline-light d-none d-sm-inline-block" href="#/vouchers"><i class="bi bi-cash-coin me-1"></i>Cash book</a>' : ''}
+  el.innerHTML = `
+  <div class="dash">
+    <section class="hero-card anim-rise">
+      <div class="hero-flame" aria-hidden="true"><span></span><span></span><span></span></div>
+      <div class="position-relative">
+        <div class="small text-white-50 text-uppercase fw-semibold">${esc(dateLabel)}</div>
+        <h1 class="h3 fw-bold text-white mb-1">${greeting()}, ${esc(Auth.user()?.name || '')}</h1>
+        <div class="text-white-50">${esc(s.shop.name)}${s.shop.tagline ? ` · ${esc(s.shop.tagline)}` : ''}</div>
+        <div class="d-flex flex-wrap gap-2 mt-3">
+          <a href="#/pos" class="btn btn-light btn-sm fw-semibold btn-pop"><i class="bi bi-cart-plus-fill me-1"></i>New counter sale</a>
+          <a href="#/stock" class="btn btn-outline-light btn-sm"><i class="bi bi-boxes me-1"></i>Stock</a>
         </div>
       </div>
-      ${!navigator.onLine ? '<div class="alert alert-secondary py-2 small"><i class="bi bi-wifi-off me-1"></i>You are offline. Everything you do is saved on this device.</div>' : ''}
-      <div class="legacy-hint"></div>
-      ${Auth.can('backup.export') && (backupDays === null || backupDays >= 7) ? `<div class="alert alert-warning py-2 small d-flex align-items-center gap-2"><i class="bi bi-shield-exclamation"></i><div class="flex-grow-1">${backupDays === null ? 'No backup has been made on this device yet.' : `Last backup was ${backupDays} days ago.`} Your data only lives on this device.</div><a class="btn btn-sm btn-warning" href="#/backup">Back up</a></div>` : ''}
+    </section>
 
-      <div class="section-title"><h2>Business hub</h2></div>
-      <div class="row g-2 stagger">
-        ${tile('#/sales', 'receipt', 'indigo', 'Sales', `${f.salesCount} today · ${esc(cur())} ${fmtNum(f.sales)}`)}
-        ${tile('#/purchases', 'bag-check', 'violet', 'Purchases', `${f.purchasesCount} today · ${esc(cur())} ${fmtNum(f.purchases)}`, 'purchase.manage')}
-        ${tile('#/products', 'box-seam', 'cyan', 'Products', `${prods.length} active items`)}
-        ${tile('#/stock', 'boxes', low.length ? 'red' : 'green', 'Inventory', low.length ? `${low.length} low / out of stock` : 'All stock levels fine')}
-        ${tile('#/customers', 'people', 'pink', 'Customers', `${customers} · due ${esc(cur())} ${fmtNum(rec)}`)}
-        ${tile('#/suppliers', 'truck', 'slate', 'Suppliers', `${suppliers} · payable ${esc(cur())} ${fmtNum(pay)}`, 'purchase.manage')}
-        ${tile('#/accounts', 'bank', 'green', 'Accounts', `Cash & bank ${esc(cur())} ${fmtNum(cash)}`, 'account.manage')}
-        ${tile('#/vouchers', 'cash-coin', 'amber', 'Cash book', 'Receipts & payments', 'voucher.create')}
-        ${tile('#/returns', 'arrow-return-left', 'red', 'Returns', f.saleReturns ? `${esc(cur())} ${fmtNum(f.saleReturns)} today` : 'Sale & purchase returns')}
-        ${tile('#/reports', 'bar-chart-line', 'indigo', 'Reports', 'Sales, stock, profit & ledgers', 'reports.view')}
-        ${tile('#/backup', 'cloud-arrow-down', 'cyan', 'Backup', backupDays === null ? 'Not backed up yet' : `Last ${backupDays}d ago`, 'backup.export')}
-        ${tile('#/settings', 'gear', 'slate', 'Settings', 'Shop, printer, tax')}
+    ${setupNeeded ? `<div class="setup-note card-lift anim-rise mt-3">
+      <div class="setup-ico"><i class="bi bi-tools"></i></div>
+      <div class="flex-grow-1 small">Finish setup: set the <b>gas price per kg</b> and the <b>swap price</b> of each cylinder so bills total correctly.</div>
+      <a class="btn btn-sm btn-grad" href="#/settings">Open settings</a></div>` : ''}
+
+    <div class="row g-3 mt-1">
+      <div class="col-12 col-lg-5">
+        <section class="card-lift tank-card anim-rise h-100" style="--d:.05s">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <div class="fw-semibold"><i class="bi bi-fuel-pump me-1 text-flame"></i>Bulk gas tank</div>
+            <a class="small" href="#/stock/gas">Read tank</a>
+          </div>
+          <div class="tank-wrap">${tankSvg(snap.gasKg, cap)}</div>
+          <div class="d-flex justify-content-between small text-body-secondary mt-2">
+            <span><b class="text-body">${fmtQty(snap.gasKg)}</b> kg in tank</span>
+            <span>Capacity ${fmtQty(cap)} kg</span>
+          </div>
+          <div class="progress mt-2" role="progressbar" aria-label="Tank level" aria-valuenow="${Math.round(tankPct * 100)}" aria-valuemin="0" aria-valuemax="100">
+            <div class="progress-bar bar-grad" style="width:${(tankPct * 100).toFixed(1)}%"></div></div>
+        </section>
       </div>
-
-      <div class="section-title"><h2>Overview</h2></div>
-      <div class="row g-2 stagger">
-        ${kpi('person-down', 'amber', 'Receivables', M(rec), Auth.can('reports.view') ? '#/reports/receivables' : '#/customers')}
-        ${Auth.can('purchase.manage') ? kpi('truck', 'red', 'Payables', M(pay), Auth.can('reports.view') ? '#/reports/payables' : null) : ''}
-        ${kpi('boxes', 'indigo', 'Stock value', M(stockValue), '#/stock')}
-        ${kpi('activity', 'cyan', 'Transactions today', `data-count="${f.txCount}"`, null)}
+      <div class="col-12 col-lg-7">
+        <div class="section-title"><i class="bi bi-circle-half"></i> Cylinders in shop</div>
+        <div class="row g-2">${cylCards}</div>
       </div>
+    </div>
 
-      <div class="row g-3 mt-1">
-        <div class="col-lg-8"><div class="card viz-card h-100">
-          <div class="viz-head"><div><div class="ttl">Sales — last 7 days</div><div class="sub">Total ${esc(cur())} ${fmtNum(wk.days.reduce((s, d) => s + d.total, 0))} · ${wk.days.reduce((s, d) => s + d.count, 0)} invoices</div></div>
-            <a class="small fw-semibold text-decoration-none" href="#/reports/sales">Report <i class="bi bi-chevron-right"></i></a></div>
-          <div class="viz week-chart"></div>
-          <details class="viz-table"><summary>Show as table</summary>
-            <table class="table table-sm table-report mt-2 mb-0"><thead><tr><th>Date</th><th class="num">Invoices</th><th class="num">Sales</th></tr></thead>
-            <tbody>${wk.days.map((d) => `<tr><td>${esc(fmtDate(d.date))}</td><td class="num">${d.count}</td><td class="num">${fmtNum(d.total)}</td></tr>`).join('')}</tbody></table></details>
-        </div></div>
-        <div class="col-lg-4"><div class="card viz-card h-100">
-          <div class="viz-head"><div><div class="ttl">Top products</div><div class="sub">By sales amount, last 7 days</div></div></div>
-          ${wk.top.length ? wk.top.map((p) => `<div class="hbar"><div class="name">${esc(p.name)}</div><div class="amt money">${fmtNum(p.amount)}</div>
-            <div class="track"><div class="fill" style="width:${Math.max(3, (p.amount / wk.top[0].amount) * 100)}%"></div></div></div>`).join('') : UI.emptyState('No sales in the last 7 days', 'graph-up')}
-        </div></div>
+    <div class="row g-2 mt-1">
+      <div class="col-6 col-md-3"><div class="kpi card-lift anim-rise" style="--d:.1s">
+        <div class="kpi-icon tone-flame"><i class="bi bi-receipt"></i></div>
+        <div class="small text-body-secondary">Sales today</div>
+        <div class="kpi-value">${money(salesToday)}</div>
+        <div class="small text-body-secondary">${todays.length} bill${todays.length === 1 ? '' : 's'}</div></div></div>
+      <div class="col-6 col-md-3"><div class="kpi card-lift anim-rise" style="--d:.15s">
+        <div class="kpi-icon tone-green"><i class="bi bi-cash-coin"></i></div>
+        <div class="small text-body-secondary">Collected today</div>
+        <div class="kpi-value">${money(cashToday)}</div>
+        <div class="small text-body-secondary">Cash &amp; bank</div></div></div>
+      <div class="col-6 col-md-3"><div class="kpi card-lift anim-rise" style="--d:.2s">
+        <div class="kpi-icon tone-blue"><i class="bi bi-droplet-half"></i></div>
+        <div class="small text-body-secondary">Gas refilled today</div>
+        <div class="kpi-value"><span data-count="${kgToday}" data-fmt="kg">0</span></div>
+        <div class="small text-body-secondary">kilograms</div></div></div>
+      <div class="col-6 col-md-3"><div class="kpi card-lift anim-rise" style="--d:.25s">
+        <div class="kpi-icon tone-violet"><i class="bi bi-arrow-left-right"></i></div>
+        <div class="small text-body-secondary">Cylinders swapped</div>
+        <div class="kpi-value"><span data-count="${outToday}" data-fmt="int">0</span> <small class="text-body-secondary">out</small> · <span data-count="${inToday}" data-fmt="int">0</span> <small class="text-body-secondary">in</small></div>
+        <div class="small text-body-secondary">today</div></div></div>
+    </div>
+
+    <div class="row g-2 mt-1">
+      <div class="col-12 col-lg-5">
+        <div class="card-lift dues-card anim-rise h-100" style="--d:.3s">
+          <div class="fw-semibold mb-2"><i class="bi bi-wallet2 me-1"></i>Money to collect &amp; pay</div>
+          <div class="d-flex justify-content-between align-items-end">
+            <div><div class="small text-body-secondary">Customers owe you</div><div class="fs-4 fw-bold text-success">${money(customerOwed)}</div></div>
+            <div class="text-end"><div class="small text-body-secondary">You owe suppliers</div><div class="fs-4 fw-bold text-danger">${money(supplierOwed)}</div></div>
+          </div>
+          <div class="d-flex gap-2 mt-3">
+            <a href="#/customers" class="btn btn-sm btn-outline-success flex-fill">Customers</a>
+            <a href="#/suppliers" class="btn btn-sm btn-outline-danger flex-fill">Suppliers</a>
+          </div>
+        </div>
       </div>
+      <div class="col-12 col-lg-7">
+        <div class="card-lift anim-rise h-100" style="--d:.35s">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <div class="fw-semibold"><i class="bi bi-exclamation-triangle me-1 text-warning"></i>Low stock accessories</div>
+            <a class="small" href="#/stock/items">All stock</a>
+          </div>
+          ${lowStock.length ? lowStock.slice(0, 5).map((i) => `<div class="list-row-static">
+              <div class="flex-grow-1 min-w-0"><div class="text-truncate fw-medium">${esc(i.name)}</div></div>
+              <span class="badge ${i.stock <= 0 ? 'text-bg-danger' : 'text-bg-warning'}">${fmtQty(i.stock)} left</span></div>`).join('')
+            : '<div class="small text-body-secondary py-3 text-center"><i class="bi bi-check-circle text-success me-1"></i>Everything is above its minimum level.</div>'}
+        </div>
+      </div>
+    </div>
 
-      <div class="row g-3 mt-1">
-        <div class="col-md-6"><div class="section-title mt-0"><h2>Recent sales</h2><a href="#/sales">View all</a></div>
-          <div class="list-card">${f.recent.map((s) => `<a class="list-row" href="#/sales/${encodeURIComponent(s.id)}">${UI.avatar(s.customerName, 'round')}<div class="main"><div class="title">${esc(s.customerName)}</div><div class="sub">${esc(s.number)} · ${fmtTime(s.createdAt)}</div></div><div class="end"><div class="fw-bold money">${fmtNum(s.total)}</div>${s.balance > 0.004 ? '<span class="badge text-bg-warning">Credit</span>' : '<span class="badge bg-success-subtle text-success-emphasis">Paid</span>'}</div></a>`).join('') || UI.emptyState('No sales yet today', 'receipt')}</div></div>
-        <div class="col-md-6"><div class="section-title mt-0"><h2>Low stock</h2><a href="#/stock">Inventory</a></div>
-          <div class="list-card">${low.slice(0, 6).map((p) => `<a class="list-row" href="#/stock/${encodeURIComponent(p.id)}">${UI.avatar(p.name)}<div class="main"><div class="title">${esc(p.name)}</div><div class="sub">Minimum ${fmtQty(p.minStock || 0)} ${esc(p.unit || '')}</div></div><div class="end"><span class="badge ${p.stock <= 0 ? 'text-bg-danger' : 'text-bg-warning'}"><i class="bi bi-${p.stock <= 0 ? 'x-octagon' : 'exclamation-triangle'} me-1"></i>${fmtQty(p.stock)} ${esc(p.unit || '')}</span></div></a>`).join('') || UI.emptyState('All stock levels are fine', 'check2-circle')}</div></div>
-      </div>`);
+    <div class="section-title mt-3"><i class="bi bi-lightning-charge"></i> Quick actions</div>
+    <div class="quick-grid">
+      <a class="quick card-lift" href="#/pos"><span class="quick-ico tone-flame"><i class="bi bi-fire"></i></span><span>Refill / Swap</span></a>
+      <a class="quick card-lift" href="#/pos"><span class="quick-ico tone-blue"><i class="bi bi-bag-plus"></i></span><span>Sell accessory</span></a>
+      <a class="quick card-lift" href="#/purchases/new"><span class="quick-ico tone-green"><i class="bi bi-truck"></i></span><span>Buy gas / cylinders</span></a>
+      <a class="quick card-lift" href="#/expenses"><span class="quick-ico tone-violet"><i class="bi bi-wallet"></i></span><span>Add expense</span></a>
+    </div>
 
-    UI.countUp(el, (v, node) => (node.dataset.money ? `${cur()} ${fmtNum(v)}` : String(Math.round(v))));
-    const chartBox = el.querySelector('.week-chart');
-    drawWeekChart(chartBox, wk.days);
-    this._resize = debounce(() => { if (chartBox.isConnected) drawWeekChart(chartBox, wk.days); }, 200);
-    window.addEventListener('resize', this._resize);
+    <div class="section-title mt-3"><i class="bi bi-clock-history"></i> Recent bills</div>
+    <div class="card-lift p-0 overflow-hidden anim-rise">
+      ${recent.length ? recent.map((b) => `<a class="list-row" href="#/sales/${encodeURIComponent(b.id)}">
+          <div class="flex-grow-1 min-w-0"><div class="fw-medium text-truncate">${esc(b.customerName)}</div>
+          <div class="small text-body-secondary">${esc(b.number)} · ${fmtDate(b.date)} ${b.createdAt ? fmtTime(b.createdAt) : ''}</div></div>
+          <div class="text-end"><div class="fw-semibold">${esc(cur())} ${fmtNum(b.total)}</div>
+          ${b.due > 0 ? '<span class="badge text-bg-warning">Due</span>' : '<span class="badge text-bg-success-subtle text-success-emphasis">Paid</span>'}</div></a>`).join('')
+        : UI.emptyState('No bills yet. Make your first counter sale.', 'receipt', '<a class="btn btn-primary btn-sm mt-2" href="#/pos">Start a sale</a>')}
+    </div>
+  </div>`;
 
-    if (Auth.can('backup.restore') && pref.get('legacyHandled') !== true) {
-      Backup.legacyDataExists().then((yes) => yes && $el.find('.legacy-hint').html('<div class="alert alert-info py-2 small d-flex align-items-center gap-2"><i class="bi bi-database"></i><div class="flex-grow-1">Data from an older version was found on this device.</div><a class="btn btn-sm btn-info" href="#/backup">Review</a></div>'));
-    }
-    const refresh = () => { if (location.hash === '' || location.hash.startsWith('#/dashboard')) this.render(el); };
-    this._h = refresh;
-    document.addEventListener('data:changed', refresh);
-  },
-  destroy() {
-    if (this._h) document.removeEventListener('data:changed', this._h);
-    if (this._resize) window.removeEventListener('resize', this._resize);
-    this._h = null; this._resize = null;
-  },
-};
+  UI.countUp(el, (n, node) => {
+    if (node.dataset.fmt === 'kg') return `${fmtQty(n)} kg`;
+    if (node.dataset.fmt === 'money') return `${cur()} ${fmtNum(n)}`;
+    return String(Math.round(n));
+  });
+  animateVisuals(el);
+}

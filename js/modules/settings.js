@@ -1,159 +1,135 @@
-// Settings: business profile, tax & numbering, printer, appearance, account, data tools.
-import { CONFIG } from '../config.js';
+// Settings: shop profile, gas pricing, cylinder types, expense categories, receipt and theme preferences.
+import { esc, num, round2 } from '../core/utils.js';
+import { getSettings, saveSettings, applyTheme, DEFAULT_EXPENSE_CATEGORIES } from '../core/settings.js';
+import { pageHeader } from '../core/ui.js';
 import * as UI from '../core/ui.js';
-import { esc, num, fmtDateTime } from '../core/utils.js';
-import { getSettings, saveSettings } from '../core/settings.js';
 import * as Auth from '../services/auth.js';
-import * as Posting from '../services/posting.js';
-import * as Printer from '../printer/printer.js';
-import * as Scanner from '../scanner/scanner.js';
 
-const $ = window.jQuery;
+const newId = () => `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
-function section(title, icon, body) {
-  return `<div class="card mb-3"><div class="card-body"><h2 class="h6 mb-3"><i class="bi bi-${icon} me-2"></i>${title}</h2>${body}</div></div>`;
+function typeRow(t, i) {
+  return `<div class="type-row" data-row>
+    <input class="form-control" name="name" value="${esc(t.name)}" placeholder="e.g. Domestic 11.8 kg" aria-label="Cylinder name">
+    <input class="form-control" name="kg" type="number" min="0" step="0.1" inputmode="decimal" value="${t.kg}" aria-label="Kilograms">
+    <input class="form-control" name="price" type="number" min="0" step="0.01" inputmode="decimal" value="${t.price}" aria-label="Swap price">
+    <button type="button" class="btn btn-light" data-rm-type aria-label="Remove type"><i class="bi bi-trash"></i></button>
+    <input type="hidden" name="id" value="${esc(t.id)}">
+  </div>`;
 }
 
-export default {
-  async render(el) {
-    const $el = $(el);
-    const s = getSettings();
-    const u = Auth.user();
-    const manage = Auth.can('settings.manage');
-    const cap = Printer.capabilities();
-    const ro = manage ? '' : 'disabled';
-    const P = s.prefixes;
-    $el.html(UI.pageHeader('Settings') + `<div class="row g-3"><div class="col-lg-6">
-      ${section('Business profile', 'shop', `<form class="f-business row g-2">
-        <div class="col-12"><label class="form-label">Business name</label><input name="name" class="form-control" value="${esc(s.business.name)}" ${ro}></div>
-        <div class="col-12"><label class="form-label">Address</label><input name="address" class="form-control" value="${esc(s.business.address)}" ${ro}></div>
-        <div class="col-6"><label class="form-label">Phone</label><input name="phone" class="form-control" value="${esc(s.business.phone)}" ${ro}></div>
-        <div class="col-6"><label class="form-label">Tax / NTN no.</label><input name="taxNo" class="form-control" value="${esc(s.business.taxNo)}" ${ro}></div>
-        <div class="col-8"><label class="form-label">Receipt footer</label><input name="footer" class="form-control" value="${esc(s.business.footer)}" ${ro}></div>
-        <div class="col-4"><label class="form-label">Currency</label><input name="currency" class="form-control" maxlength="5" value="${esc(s.currency)}" ${ro}></div>
-        ${manage ? '<div class="col-12"><button class="btn btn-primary">Save</button></div>' : ''}</form>`)}
-      ${section('Sales, stock & numbering', 'sliders', `<form class="f-sales row g-2">
-        <div class="col-12"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" name="taxEnabled" id="s-tax" ${s.taxEnabled ? 'checked' : ''} ${ro}><label class="form-check-label" for="s-tax">Charge sales tax</label></div></div>
-        <div class="col-6"><label class="form-label">Tax rate (%)</label><input name="taxRate" class="form-control" inputmode="decimal" value="${s.taxRate}" ${ro}></div>
-        <div class="col-12"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" name="allowNegativeStock" id="s-neg" ${s.allowNegativeStock ? 'checked' : ''} ${ro}><label class="form-check-label" for="s-neg">Allow selling when stock is insufficient</label></div></div>
-        <div class="col-12"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" name="updatePurchasePrice" id="s-upp" ${s.updatePurchasePrice ? 'checked' : ''} ${ro}><label class="form-check-label" for="s-upp">Update product cost price from latest purchase</label></div></div>
-        <div class="col-12 small text-body-secondary mt-2">Document number prefixes (use a different prefix on each device if several devices sell at the same time)</div>
-        ${[['sale', 'Sale'], ['purchase', 'Purchase'], ['saleReturn', 'Sale return'], ['purchaseReturn', 'Purchase return'], ['receipt', 'Receipt'], ['payment', 'Payment'], ['transfer', 'Transfer'], ['adjustment', 'Adjustment']]
-          .map(([k, l]) => `<div class="col-6 col-md-3"><label class="form-label small">${l}</label><input name="p_${k}" class="form-control form-control-sm" maxlength="12" value="${esc(P[k])}" ${ro} pattern="[A-Za-z0-9]+"></div>`).join('')}
-        ${manage ? '<div class="col-12"><button class="btn btn-primary">Save</button></div>' : ''}</form>`)}
-      ${section('Appearance', 'palette', `<select class="form-select f-theme"><option value="auto">Follow device</option><option value="light">Light</option><option value="dark">Dark</option></select>`)}
-    </div><div class="col-lg-6">
-      ${section('Receipt printer', 'printer', `
-        <div class="alert ${cap.webBluetooth ? 'alert-info' : 'alert-secondary'} small py-2">${esc(cap.note)}</div>
-        <form class="f-printer row g-2">
-          <div class="col-12"><label class="form-label">Print method</label><select name="method" class="form-select">
-            <option value="browser" ${s.printer.method === 'browser' ? 'selected' : ''}>Browser print dialog (any printer, PDF, AirPrint)</option>
-            <option value="bluetooth" ${s.printer.method === 'bluetooth' ? 'selected' : ''} ${cap.webBluetooth ? '' : 'disabled'}>Bluetooth ESC/POS printer (Web Bluetooth, BLE)${cap.webBluetooth ? '' : ' — not supported here'}</option>
-            <option value="rawbt" ${s.printer.method === 'rawbt' ? 'selected' : ''}>RawBT app (Android, Classic Bluetooth printers)</option></select></div>
-          <div class="col-6"><label class="form-label">Paper width</label><select name="width" class="form-select"><option value="58" ${s.printer.width == 58 ? 'selected' : ''}>58 mm (32 chars)</option><option value="80" ${s.printer.width == 80 ? 'selected' : ''}>80 mm (48 chars)</option></select></div>
-          <div class="col-6"><label class="form-label">Copies</label><input name="copies" type="number" min="1" max="5" class="form-control" value="${s.printer.copies || 1}"></div>
-          <div class="col-12"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" name="autoPrint" id="s-ap" ${s.printer.autoPrint ? 'checked' : ''}><label class="form-check-label" for="s-ap">Print receipt automatically after each sale</label></div></div>
-        </form>
-        <div class="bt-box mt-3 ${s.printer.method === 'bluetooth' ? '' : 'd-none'}">
-          <div class="d-flex align-items-center gap-2 mb-2"><i class="bi bi-bluetooth"></i><span class="bt-status small flex-grow-1"></span></div>
-          <div class="d-flex gap-2"><button class="btn btn-outline-primary btn-bt-connect">Connect printer</button><button class="btn btn-outline-secondary btn-bt-disconnect">Disconnect</button></div>
-          <label class="form-label mt-3">Transfer speed</label>
-          <select class="form-select f-chunk">${Object.entries(Printer.CHUNK_SIZES).map(([v, l]) => `<option value="${v}" ${Number(s.printer.chunkSize || 20) === Number(v) ? 'selected' : ''}>${l}</option>`).join('')}</select>
-          <div class="form-text">If receipts come out cut off or garbled, choose Safe.</div>
-        </div>
-        <div class="rawbt-box small text-body-secondary mt-2 ${s.printer.method === 'rawbt' ? '' : 'd-none'}">Install the free <b>RawBT</b> app from Google Play, pair your printer in RawBT, then print from here. Receipts are sent as ESC/POS data.</div>
-        <div class="img-box mt-3 ${s.printer.method === 'browser' ? 'd-none' : ''}">
-          <label class="form-label">Urdu printing mode</label>
-          <select class="form-select f-imgmode">
-            <option value="gsv0" ${s.printer.imageMode !== 'escstar' ? 'selected' : ''}>Standard (GS v 0) — most printers</option>
-            <option value="escstar" ${s.printer.imageMode === 'escstar' ? 'selected' : ''}>Compatibility (ESC *) — older printers</option></select>
-          <div class="form-text">Urdu is printed as an image. If Test print shows blank space or garbage where Urdu should be, switch to Compatibility.</div>
-        </div>
-        <button class="btn btn-outline-secondary mt-3 btn-test"><i class="bi bi-printer me-1"></i>Test print (incl. Urdu)</button>`)}
-      ${section('My account', 'person-circle', `<div class="mb-2"><b>${esc(u.username)}</b><div class="small text-body-secondary">${esc(Auth.ROLES[u.role] || u.role)}</div></div>
-        <div class="small">Session valid until <b>${esc(fmtDateTime(new Date(Auth.expiresAt()).toISOString()))}</b>. After that, sign in again while online.</div>
-        <div class="small mt-1">Device ID: <code class="user-select-all">${esc(Auth.deviceId())}</code></div>
-        <div class="form-text">This account is linked to this device. To move it to another phone or change the password, call ${esc(CONFIG.SUPPORT_PHONE)}.</div>`)}
-      ${section('App & data', 'phone', `<div class="small mb-2">Version ${esc(CONFIG.APP_VERSION)} · <span class="storage-info">checking storage…</span></div>
-        <div class="d-flex flex-wrap gap-2">
-          <button class="btn btn-outline-secondary btn-install d-none"><i class="bi bi-download me-1"></i>Install app</button>
-          ${manage ? '<button class="btn btn-outline-secondary btn-integrity"><i class="bi bi-shield-check me-1"></i>Check data integrity</button><button class="btn btn-outline-secondary btn-rebuild"><i class="bi bi-arrow-repeat me-1"></i>Recalculate stock</button>' : ''}
-        </div>
-        <div class="d-flex align-items-center gap-2 mt-3"><i class="bi bi-camera"></i><span class="small flex-grow-1">Camera for barcode scanning: <b class="cam-state">checking…</b></span>
-          <button class="btn btn-sm btn-outline-secondary btn-cam-test">Test camera</button></div>
-        <div class="cam-help mt-2"></div>
-        <div class="small text-body-secondary mt-2 ios-hint d-none">On iPhone/iPad: tap <i class="bi bi-box-arrow-up"></i> Share → <b>Add to Home Screen</b> to install.</div>`)}
-    </div></div>`);
+export async function render(el, { setTitle }) {
+  setTitle('Settings');
+  const s = getSettings();
+  const can = Auth.can('settings.manage');
+  const dis = can ? '' : 'disabled';
 
-    $el.find('.f-theme').val(s.theme).on('change', function () { saveSettings({ theme: this.value }); });
-    $el.on('submit', '.f-business', (e) => {
-      e.preventDefault();
-      const v = Object.fromEntries(new FormData(e.target).entries());
-      if (!v.name.trim()) return UI.toast('Business name is required', 'warning');
-      saveSettings({ business: { name: v.name.trim(), address: v.address.trim(), phone: v.phone.trim(), taxNo: v.taxNo.trim(), footer: v.footer.trim() }, currency: v.currency.trim() || 'Rs' });
-      UI.toast('Business profile saved');
+  el.innerHTML = `
+  <div class="anim-rise">
+    ${pageHeader('Settings', can ? '<button class="btn btn-grad btn-sm" id="st-save"><i class="bi bi-check2 me-1"></i>Save</button>' : '')}
+    ${can ? '' : '<div class="alert alert-info small">Only the owner or a manager can change shop settings. You can still change the theme and receipt preference.</div>'}
+    <form id="st-form" novalidate autocomplete="off">
+      <section class="card-lift p-3 mb-3">
+        <div class="section-title mt-0"><i class="bi bi-shop"></i> Shop profile</div>
+        <div class="row g-2">
+          <div class="col-12 col-md-6"><label class="form-label">Shop name</label><input class="form-control" name="shop.name" value="${esc(s.shop.name)}" ${dis} required></div>
+          <div class="col-12 col-md-6"><label class="form-label">Tagline</label><input class="form-control" name="shop.tagline" value="${esc(s.shop.tagline)}" ${dis}></div>
+          <div class="col-12 col-md-6"><label class="form-label">Phone</label><input class="form-control" name="shop.phone" inputmode="tel" value="${esc(s.shop.phone)}" ${dis}></div>
+          <div class="col-12 col-md-6"><label class="form-label">License no.</label><input class="form-control" name="shop.license" value="${esc(s.shop.license)}" ${dis}></div>
+          <div class="col-12"><label class="form-label">Address</label><input class="form-control" name="shop.address" value="${esc(s.shop.address)}" ${dis}></div>
+          <div class="col-12"><label class="form-label">Receipt footer</label><input class="form-control" name="shop.footer" value="${esc(s.shop.footer)}" maxlength="200" ${dis}></div>
+        </div>
+      </section>
+
+      <section class="card-lift p-3 mb-3">
+        <div class="section-title mt-0"><i class="bi bi-fire"></i> Gas pricing</div>
+        <div class="row g-2">
+          <div class="col-6 col-md-3"><label class="form-label">Currency</label><input class="form-control" name="currency" value="${esc(s.currency)}" maxlength="6" ${dis}></div>
+          <div class="col-6 col-md-3"><label class="form-label">Refill price per kg</label><input class="form-control" name="gasRate" type="number" min="0" step="0.01" inputmode="decimal" value="${s.gasRate}" ${dis}></div>
+          <div class="col-6 col-md-3"><label class="form-label">Tank capacity (kg)</label><input class="form-control" name="tankCapacityKg" type="number" min="1" step="1" inputmode="decimal" value="${s.tankCapacityKg}" ${dis}></div>
+          <div class="col-6 col-md-3"><label class="form-label">Bill prefix</label><input class="form-control" name="prefixes.bill" value="${esc(s.prefixes.bill)}" maxlength="8" ${dis}></div>
+        </div>
+      </section>
+
+      <section class="card-lift p-3 mb-3">
+        <div class="d-flex justify-content-between align-items-center mt-0 mb-2">
+          <div class="section-title mt-0"><i class="bi bi-circle-half"></i> Cylinder types</div>
+          ${can ? '<button type="button" class="btn btn-light btn-sm" id="st-add-type"><i class="bi bi-plus-lg me-1"></i>Add type</button>' : ''}
+        </div>
+        <div class="type-head small text-body-secondary"><span>Name</span><span>Kg</span><span>Swap price</span><span></span></div>
+        <div id="st-types">${s.cylinderTypes.map(typeRow).join('')}</div>
+        <div class="form-text">Swap price = what the customer pays for one full cylinder you hand over. Changing a type does not change old bills.</div>
+      </section>
+
+      <section class="card-lift p-3 mb-3">
+        <div class="section-title mt-0"><i class="bi bi-tags"></i> Expense categories</div>
+        <textarea class="form-control" name="expenseCategories" rows="3" ${dis}>${esc(s.expenseCategories.join(', '))}</textarea>
+        <div class="form-text">Separate categories with commas. <a href="#" data-reset-cats>Reset to defaults</a></div>
+      </section>
+
+      <section class="card-lift p-3 mb-3">
+        <div class="section-title mt-0"><i class="bi bi-sliders"></i> This device</div>
+        <div class="form-check form-switch mb-3"><input class="form-check-input" type="checkbox" role="switch" id="st-autoprint" name="autoPrint" ${s.autoPrint ? 'checked' : ''}>
+          <label class="form-check-label" for="st-autoprint">Print receipt automatically after each sale</label></div>
+        <label class="form-label">Theme</label>
+        <div class="btn-group w-100" role="group" aria-label="Theme">
+          ${[['auto', 'Auto', 'circle-half'], ['light', 'Light', 'sun'], ['dark', 'Dark', 'moon-stars']].map(([v, l, i]) =>
+            `<input type="radio" class="btn-check" name="theme" id="th-${v}" value="${v}" ${s.theme === v ? 'checked' : ''}>
+             <label class="btn btn-outline-secondary" for="th-${v}"><i class="bi bi-${i} me-1"></i>${l}</label>`).join('')}
+        </div>
+      </section>
+    </form>
+  </div>`;
+
+  const $el = window.jQuery(el);
+  $el.on('click', '#st-add-type', () => {
+    $el.find('#st-types').append(typeRow({ id: newId(), name: '', kg: 0, price: 0 }));
+  });
+  $el.on('click', '[data-rm-type]', (e) => {
+    if ($el.find('[data-row]').length <= 1) return UI.toast('Keep at least one cylinder type.', 'warning');
+    window.jQuery(e.currentTarget).closest('[data-row]').remove();
+  });
+  $el.on('click', '[data-reset-cats]', (e) => {
+    e.preventDefault();
+    $el.find('[name=expenseCategories]').val(DEFAULT_EXPENSE_CATEGORIES.join(', '));
+  });
+  $el.on('change', '[name=theme]', (e) => { saveSettings({ theme: e.target.value }); applyTheme(); });
+  $el.on('change', '#st-autoprint', (e) => saveSettings({ autoPrint: e.target.checked }));
+
+  $el.on('click', '#st-save', () => save(el));
+}
+
+function save(el) {
+  const $el = window.jQuery(el);
+  try {
+    const get = (n) => $el.find(`[name="${n}"]`).val();
+    const types = [];
+    $el.find('[data-row]').each(function () {
+      const row = window.jQuery(this);
+      const name = String(row.find('[name=name]').val() || '').trim();
+      const kg = round2(num(row.find('[name=kg]').val()));
+      if (!name) throw new Error('Every cylinder type needs a name.');
+      if (kg <= 0) throw new Error(`Enter the kilograms for ${name}.`);
+      types.push({ id: row.find('[name=id]').val(), name, kg, price: round2(Math.max(0, num(row.find('[name=price]').val()))) });
     });
-    $el.on('submit', '.f-sales', (e) => {
-      e.preventDefault();
-      const f = e.target; const v = Object.fromEntries(new FormData(f).entries());
-      const rate = num(v.taxRate);
-      if (rate < 0 || rate > 100) return UI.toast('Tax rate must be between 0 and 100', 'warning');
-      const prefixes = {};
-      for (const k of Object.keys(P)) {
-        const p = String(v['p_' + k] || '').trim().toUpperCase();
-        if (!/^[A-Z0-9]{1,12}$/.test(p)) return UI.toast(`Invalid prefix for ${k}. Use letters and digits only.`, 'warning');
-        prefixes[k] = p;
-      }
-      saveSettings({ taxEnabled: f.taxEnabled.checked, taxRate: rate, allowNegativeStock: f.allowNegativeStock.checked, updatePurchasePrice: f.updatePurchasePrice.checked, prefixes });
-      UI.toast('Settings saved');
-    });
-    const btStatus = () => $el.find('.bt-status').text(Printer.isConnected() ? `Connected: ${Printer.connectedName()}` : getSettings().printer.deviceName ? `Not connected (last: ${getSettings().printer.deviceName})` : 'No printer connected');
-    btStatus();
-    const onPrinter = () => btStatus();
-    document.addEventListener('printer:changed', onPrinter);
-    this._off = () => document.removeEventListener('printer:changed', onPrinter);
-    $el.on('change', '.f-printer', (e) => {
-      const f = e.currentTarget;
-      const copies = Math.max(1, Math.min(5, parseInt(f.copies.value, 10) || 1));
-      saveSettings({ printer: { method: f.method.value, width: Number(f.width.value), autoPrint: f.autoPrint.checked, copies } });
-      $el.find('.bt-box').toggleClass('d-none', f.method.value !== 'bluetooth');
-      $el.find('.rawbt-box').toggleClass('d-none', f.method.value !== 'rawbt');
-      $el.find('.img-box').toggleClass('d-none', f.method.value === 'browser');
-    });
-    $el.on('change', '.f-imgmode', function () { saveSettings({ printer: { imageMode: this.value } }); UI.toast('Urdu printing mode saved'); });
-    $el.on('change', '.f-chunk', function () { saveSettings({ printer: { chunkSize: Number(this.value) } }); UI.toast('Printer speed saved'); });
-    $el.on('click', '.btn-bt-connect', async () => { try { const n = await Printer.connectBluetooth(); UI.toast(`Connected to ${n || 'printer'}`); } catch (e) { UI.toastError(e); } btStatus(); });
-    $el.on('click', '.btn-bt-disconnect', () => { Printer.disconnect(); btStatus(); });
-    const camState = async () => {
-      const st = await Scanner.cameraPermission();
-      $el.find('.cam-state').text({ granted: 'Allowed', denied: 'Blocked', prompt: 'Not asked yet', unknown: 'Unknown' }[st] || st)
-        .attr('class', `cam-state text-${st === 'granted' ? 'success' : st === 'denied' ? 'danger' : 'body'}`);
-      $el.find('.cam-help').html(Scanner.inAppBrowser() ? Scanner.cameraHelpHTML('inapp') : st === 'denied' ? Scanner.cameraHelpHTML('site') : '');
+    if (!types.length) throw new Error('Add at least one cylinder type.');
+    const shopName = String(get('shop.name') || '').trim();
+    if (!shopName) throw new Error('Enter the shop name.');
+    const cats = String(get('expenseCategories') || '').split(',').map((c) => c.trim()).filter(Boolean);
+    if (!cats.length) throw new Error('Add at least one expense category.');
+
+    const patch = {
+      shop: {
+        name: shopName, tagline: get('shop.tagline') || '', phone: get('shop.phone') || '',
+        license: get('shop.license') || '', address: get('shop.address') || '', footer: get('shop.footer') || '',
+      },
+      currency: String(get('currency') || 'Rs').trim() || 'Rs',
+      gasRate: round2(Math.max(0, num(get('gasRate')))),
+      tankCapacityKg: Math.max(1, num(get('tankCapacityKg'), 1000)),
+      prefixes: { bill: String(get('prefixes.bill') || 'GS').trim() || 'GS', purchase: getSettings().prefixes.purchase },
+      cylinderTypes: types,
+      expenseCategories: cats,
     };
-    camState();
-    $el.on('click', '.btn-cam-test', async () => {
-      const code = await Scanner.scan({ title: 'Test camera' });
-      if (code) UI.toast(`Camera works — read ${code}`);
-      camState();
-    });
-    $el.on('click', '.btn-test', async () => { try { await Printer.testPrint(); } catch (e) { UI.toastError(e); } });
-    const { canInstall, promptInstall } = await import('../app.js');
-    if (canInstall()) $el.find('.btn-install').removeClass('d-none').on('click', promptInstall);
-    if (Printer.capabilities().ios && !window.matchMedia('(display-mode: standalone)').matches) $el.find('.ios-hint').removeClass('d-none');
-    if (navigator.storage?.estimate) {
-      const [est, persisted] = await Promise.all([navigator.storage.estimate(), navigator.storage.persisted?.() ?? false]);
-      $el.find('.storage-info').text(`${(est.usage / 1048576).toFixed(1)} MB used · storage ${persisted ? 'persistent' : 'best-effort (may be cleared by the browser under pressure)'}`);
-    } else $el.find('.storage-info').text('');
-    $el.on('click', '.btn-integrity', async () => {
-      const r = await UI.withLoading(() => Posting.integrityCheck(), 'Checking…');
-      await UI.confirmDialog(`<p>Checked ${r.checked.entries} ledger entries, ${r.checked.stockMoves} stock movements and ${r.checked.products} products.</p>${r.issues.length ? `<div class="alert alert-warning small">${r.issues.slice(0, 50).map(esc).join('<br>')}</div>` : '<div class="alert alert-success mb-0">No problems found.</div>'}`, { html: true, title: 'Data integrity', okLabel: 'OK' });
-    });
-    $el.on('click', '.btn-rebuild', async () => {
-      try {
-        const fixed = await UI.withLoading(() => Posting.rebuildStock(), 'Recalculating…');
-        UI.toast(fixed.length ? `Corrected stock for ${fixed.length} product(s)` : 'All stock quantities already match the stock ledger', fixed.length ? 'warning' : 'success');
-      } catch (e) { UI.toastError(e); }
-    });
-  },
-  destroy() { this._off?.(); this._off = null; },
-};
+    saveSettings(patch);
+    UI.toast('Settings saved');
+  } catch (e) { UI.toastError(e); }
+}

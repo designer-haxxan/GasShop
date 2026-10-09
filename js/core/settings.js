@@ -1,20 +1,35 @@
-// Lightweight settings/preferences stored in LocalStorage (never operational data or secrets).
+// Shop profile, gas pricing, cylinder types and preferences stored in LocalStorage (never operational data or secrets).
 import { storageKey } from '../config.js';
 
-const KEY = storageKey('settings');
-const LEGACY_KEY = 'pos.settings'; // shared by older builds on the same origin; copied once as a starting point
+const KEY = storageKey('gasshop.settings');
+
+export const DEFAULT_EXPENSE_CATEGORIES = [
+  'Rent', 'Electricity', 'Salaries', 'Transport', 'Repairs & Maintenance', 'Cylinder Testing',
+  'Staff Food & Tea', 'Cleaning', 'Stationery', 'Other',
+];
 
 export const DEFAULT_SETTINGS = {
-  business: { name: 'My Store', address: '', phone: '', taxNo: '', footer: 'Thank you for your purchase!' },
+  shop: {
+    name: 'My Gas Shop',
+    tagline: 'Fast refills · Safe cylinders',
+    address: '',
+    phone: '',
+    license: '',
+    footer: 'Thank you for your business. Check hoses and regulators regularly.',
+  },
   currency: 'Rs',
-  taxEnabled: false,
-  taxRate: 0,
-  allowNegativeStock: false,
-  updatePurchasePrice: true,
-  prefixes: { sale: 'SALE', purchase: 'PUR', saleReturn: 'SRN', purchaseReturn: 'PRN', receipt: 'RCV', payment: 'PAY', transfer: 'TRF', adjustment: 'ADJ' },
-  printer: { method: 'browser', width: 58, autoPrint: false, copies: 1, chunkSize: 20, imageMode: 'gsv0', deviceName: '', deviceId: '' },
+  gasRate: 0,              // price per kg of gas for refilling a customer's own cylinder
+  tankCapacityKg: 1000,    // bulk gas storage capacity, used for the tank gauge
+  // Cylinder types the shop sells, exchanges and refills. price = exchange price per full cylinder.
+  cylinderTypes: [
+    { id: 'd11', name: 'Domestic 11.8 kg', kg: 11.8, price: 0 },
+    { id: 'c15', name: 'Commercial 15 kg', kg: 15, price: 0 },
+    { id: 'c45', name: 'Commercial 45 kg', kg: 45, price: 0 },
+  ],
+  expenseCategories: DEFAULT_EXPENSE_CATEGORIES,
+  prefixes: { bill: 'GS', purchase: 'PO' },
+  autoPrint: false,        // print a receipt automatically after each sale
   theme: 'auto',
-  register: 'Main',
 };
 
 function merge(base, over) {
@@ -30,7 +45,7 @@ let cache = null;
 export function getSettings() {
   if (!cache) {
     let stored = {};
-    try { stored = JSON.parse(localStorage.getItem(KEY) || localStorage.getItem(LEGACY_KEY) || '{}'); } catch { stored = {}; }
+    try { stored = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { stored = {}; }
     cache = merge(DEFAULT_SETTINGS, stored);
   }
   return cache;
@@ -47,17 +62,20 @@ export function replaceSettings(all) {
   cache = merge(DEFAULT_SETTINGS, all || {});
   localStorage.setItem(KEY, JSON.stringify(cache));
   document.dispatchEvent(new CustomEvent('settings:changed', { detail: cache }));
+  return cache;
 }
+
+export const cylinderType = (id) => getSettings().cylinderTypes.find((t) => t.id === id) || null;
 
 // Small per-device preference helpers
 export const pref = {
   get(k, d = null) { try { const v = localStorage.getItem(storageKey('pref.' + k)); return v === null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { localStorage.setItem(storageKey('pref.' + k), JSON.stringify(v)); },
+  set(k, v) { try { localStorage.setItem(storageKey('pref.' + k), JSON.stringify(v)); } catch { /* storage full or blocked */ } },
 };
 
 export function applyTheme() {
   const t = getSettings().theme;
   const dark = t === 'dark' || (t === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.setAttribute('data-bs-theme', dark ? 'dark' : 'light');
-  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#0f1117' : '#f4f5fb');
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#0b1120' : '#ea580c');
 }

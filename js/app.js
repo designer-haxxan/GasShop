@@ -5,29 +5,25 @@ import * as UI from './core/ui.js';
 import { esc } from './core/utils.js';
 import { openDB } from './db/idb.js';
 import * as Auth from './services/auth.js';
-import * as Catalog from './services/catalog.js';
 
 const $ = window.jQuery;
 
 // Route table: name → [loader, title, permission|null, icon, menu section]
+// Sub-pages take params after the name, e.g. #/sales/<billId>, #/purchases/new, #/purchases/<purchaseId>.
 const ROUTES = {
-  dashboard: [() => import('./modules/dashboard.js'), 'Dashboard', null, 'house', 'Main'],
-  pos: [() => import('./modules/pos.js'), 'New Sale', 'sale.create', 'cart-plus', 'Main'],
-  sales: [() => import('./modules/documents.js'), 'Sales', null, 'receipt', 'Main'],
-  purchase: [() => import('./modules/pos.js'), 'New Purchase', 'purchase.manage', null, null],
-  purchases: [() => import('./modules/documents.js'), 'Purchases', 'purchase.manage', 'bag', 'Main'],
-  returns: [() => import('./modules/documents.js'), 'Returns', null, 'arrow-return-left', 'Main'],
-  products: [() => import('./modules/products.js'), 'Products', null, 'box-seam', 'Inventory'],
-  stock: [() => import('./modules/stock.js'), 'Stock', null, 'boxes', 'Inventory'],
+  dashboard: [() => import('./modules/dashboard.js'), 'Dashboard', null, 'speedometer2', 'Counter'],
+  pos: [() => import('./modules/pos.js'), 'Counter Sale', 'sale.create', 'cart-plus', 'Counter'],
+  sales: [() => import('./modules/sales.js'), 'Sales & Bills', null, 'receipt', 'Counter'],
+  stock: [() => import('./modules/stock.js'), 'Stock', null, 'boxes', 'Stock'],
+  purchases: [() => import('./modules/purchases.js'), 'Purchases', 'purchase.manage', 'truck', 'Stock'],
   customers: [() => import('./modules/parties.js'), 'Customers', null, 'people', 'Parties'],
-  suppliers: [() => import('./modules/parties.js'), 'Suppliers', 'purchase.manage', 'truck', 'Parties'],
-  vouchers: [() => import('./modules/vouchers.js'), 'Cash Book & Payments', 'voucher.create', 'cash-coin', 'Accounts'],
-  accounts: [() => import('./modules/accounts.js'), 'Accounts', 'account.manage', 'bank', 'Accounts'],
-  reports: [() => import('./reports/reports.js'), 'Reports', 'reports.view', 'bar-chart-line', 'Accounts'],
-  backup: [() => import('./modules/backup.js'), 'Backup & Restore', 'backup.export', 'cloud-arrow-down', 'Administration'],
-  settings: [() => import('./modules/settings.js'), 'Settings', null, 'gear', 'Administration'],
+  suppliers: [() => import('./modules/parties.js'), 'Suppliers', 'purchase.manage', 'building', 'Parties'],
+  expenses: [() => import('./modules/expenses.js'), 'Expenses & Cash', 'reports.view', 'cash-coin', 'Money'],
+  reports: [() => import('./modules/reports.js'), 'Reports', 'reports.view', 'bar-chart-line', 'Money'],
+  backup: [() => import('./modules/backup.js'), 'Backup & Restore', 'backup.export', 'cloud-arrow-down', 'Admin'],
+  settings: [() => import('./modules/settings.js'), 'Settings', null, 'gear', 'Admin'],
 };
-const FOCUS_ROUTES = new Set(['pos', 'purchase']);
+const FOCUS_ROUTES = new Set(['pos']);
 
 let currentModule = null;
 let routeToken = 0;
@@ -104,7 +100,7 @@ function buildMenu() {
   $('#user-name').text(u.name);
   $('#user-role').text(Auth.ROLES[u.role] || u.role);
   $('#user-avatar').text(UI.initials(u.name));
-  $('#brand-name').text(getSettings().business.name || CONFIG.APP_NAME);
+  $('#brand-name').text(getSettings().shop.name || CONFIG.APP_NAME);
   $('#bottom-nav [data-route="pos"]').toggleClass('d-none', !Auth.can('sale.create'));
 }
 
@@ -126,7 +122,7 @@ async function route() {
   if (perm && !Auth.can(perm)) { $c.html(UI.emptyState('You do not have permission to open this page.', 'shield-lock')); return; }
   $c.html(UI.spinner());
   try {
-    const mod = (await loader()).default;
+    const mod = await loader();
     if (token !== routeToken) return;
     currentModule = mod;
     window.scrollTo(0, 0);
@@ -141,7 +137,6 @@ async function route() {
 
 // ---------- Auth gate ----------
 async function startApp() {
-  await Catalog.load();
   buildMenu();
   showView('app');
   renderConn(navigator.onLine ? 'online' : 'offline');
@@ -200,7 +195,7 @@ $('#toggle-pw').on('click', () => {
 $('#logout-btn').on('click', () => doLogout(false));
 $('#install-btn').on('click', promptInstall);
 window.addEventListener('hashchange', route);
-document.addEventListener('settings:changed', () => { applyTheme(); if (Auth.user()) $('#brand-name').text(getSettings().business.name || CONFIG.APP_NAME); });
+document.addEventListener('settings:changed', () => { applyTheme(); if (Auth.user()) $('#brand-name').text(getSettings().shop.name || CONFIG.APP_NAME); });
 document.addEventListener('auth:changed', () => { if (Auth.user()) buildMenu(); });
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', applyTheme);
 

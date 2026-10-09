@@ -1,151 +1,180 @@
-// Customers & suppliers: list, create/edit, ledger/statement, payments.
-import * as UI from '../core/ui.js';
-import { esc, today, monthStart, debounce } from '../core/utils.js';
-import { balText, dateFilter, bindDateFilter, ledgerTable, pager } from '../core/views.js';
-import * as Auth from '../services/auth.js';
-import * as Catalog from '../services/catalog.js';
-import * as Posting from '../services/posting.js';
-import { printHTML } from '../printer/printer.js';
+// Customers and suppliers: balances, add/edit, statements (ledger) and payments.
+import { read } from '../db/idb.js';
+import { esc, fmtNum, fmtDate, today, lc, round2, debounce } from '../core/utils.js';
 import { getSettings } from '../core/settings.js';
-import { storageKey } from '../config.js';
+import { printHtml, shopHeader } from '../core/print.js';
+import { avatar, pageHeader, emptyState } from '../core/ui.js';
+import * as UI from '../core/ui.js';
+import * as Auth from '../services/auth.js';
+import * as Gas from '../services/gas.js';
+import { pager as listPager, plainNum } from '../core/views.js';
 
-const $ = window.jQuery;
-const LABEL = { customers: ['Customer', 'Customers', 'Receivable'], suppliers: ['Supplier', 'Suppliers', 'Payable'] };
-const canEdit = (kind) => Auth.can(kind === 'customers' ? 'party.edit' : 'purchase.manage');
+const cur = () => getSettings().currency;
+const f2 = (n) => fmtNum(n);
+const LABEL = { customer: { one: 'Customer', many: 'Customers', owes: 'owes you', ok: 'No dues' }, supplier: { one: 'Supplier', many: 'Suppliers', owes: 'you owe', ok: 'Settled' } };
 
-export async function editParty(kind, party = null) {
-  const [one] = LABEL[kind];
-  const p = party || {};
+// Add / edit a customer or supplier. Resolves to the saved row, or undefined when cancelled.
+export async function openPartyForm(type, existing = null) {
+  const L = LABEL[type];
+  const e = existing || {};
   return UI.formModal({
-    title: party ? `Edit ${one.toLowerCase()}` : `New ${one.toLowerCase()}`,
-    body: `<div class="row g-2">
-      <div class="col-12"><label class="form-label">Name *</label><input name="name" class="form-control" required maxlength="120" value="${esc(p.name)}"></div>
-      <div class="col-6"><label class="form-label">Phone</label><input name="phone" type="tel" class="form-control" value="${esc(p.phone)}"></div>
-      <div class="col-6"><label class="form-label">Email</label><input name="email" type="email" class="form-control" value="${esc(p.email)}"></div>
-      <div class="col-12"><label class="form-label">Address</label><input name="address" class="form-control" value="${esc(p.address)}"></div>
-      <div class="col-6"><label class="form-label">Opening ${LABEL[kind][2].toLowerCase()}</label><input name="openingBalance" class="form-control" inputmode="decimal" value="${p.openingBalance || ''}" placeholder="0"><div class="form-text">Use a negative amount for an advance.</div></div>
-      <div class="col-6"><label class="form-label">As of date</label><input name="openingDate" type="date" class="form-control" value="${esc(p.openingDate || today())}"></div>
-      <div class="col-12"><label class="form-label">Note</label><textarea name="note" class="form-control" rows="2">${esc(p.note)}</textarea></div>
-      ${party ? `<div class="col-12"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" name="active" id="pa-active" ${p.active ? 'checked' : ''}><label class="form-check-label" for="pa-active">Active</label></div></div>` : ''}
-    </div>`,
-    onSubmit: (v) => Posting.saveParty(kind, { ...v, id: party?.id, active: party ? v.active : true }),
+    title: existing ? `Edit ${L.one.toLowerCase()}` : `New ${L.one.toLowerCase()}`,
+    submitLabel: existing ? 'Save changes' : `Add ${L.one.toLowerCase()}`,
+    body: `
+      <div class="mb-3"><label class="form-label fw-semibold">Name</label>
+        <input class="form-control form-control-lg" name="name" value="${esc(e.name || '')}" required autocomplete="off"></div>
+      <div class="row g-2 mb-3">
+        <div class="col-6"><label class="form-label">Phone</label>
+          <input class="form-control" name="phone" inputmode="tel" value="${esc(e.phone || '')}"></div>
+        <div class="col-6"><label class="form-label">Opening balance</label>
+          <input class="form-control" name="openingBalance" type="number" step="0.01" inputmode="decimal" value="${e.openingBalance || ''}" placeholder="0"></div>
+      </div>
+      <div class="mb-1"><label class="form-label">Address</label>
+        <input class="form-control" name="address" value="${esc(e.address || '')}"></div>
+      <div class="form-text">${type === 'customer'
+        ? 'Opening balance = dues from before this app (use a negative number if they have credit).'
+        : 'Opening balance = what you already owe this supplier (negative if they owe you).'}</div>`,
+    onSubmit: (v) => Gas.saveParty(type, { id: e.id, name: v.name, phone: v.phone, address: v.address, openingBalance: v.openingBalance }),
   });
 }
 
-// Picker returning a party, null (none) or undefined (cancelled).
-export async function partyPicker(kind, { noneLabel = null } = {}) {
-  const bal = await Posting.allBalances();
-  const r = await UI.pick({
-    title: `Select ${LABEL[kind][0].toLowerCase()}`, noneLabel,
-    placeholder: 'Search name or phone…',
-    addNew: canEdit(kind) ? { label: `New ${LABEL[kind][0].toLowerCase()}`, create: () => editParty(kind) } : null,
-    search: async (q) => Catalog.searchParties(kind, q).map((p) => {
-      const b = bal.get(Posting.partyAccount(kind, p.id))?.balance || 0;
-      return { id: p.id, title: p.name, subtitle: p.phone || p.email || '', right: b ? balText(b, kind === 'customers').replace(/&amp;/g, '&') : '', value: p };
-    }),
+async function paymentForm(type, party) {
+  const L = LABEL[type];
+  const ok = await UI.formModal({
+    title: type === 'customer' ? `Receive from ${party.name}` : `Pay ${party.name}`,
+    submitLabel: type === 'customer' ? 'Receive payment' : 'Record payment',
+    body: `<label class="form-label fw-semibold">Amount (${esc(cur())})</label>
+      <input class="form-control form-control-lg fw-bold" name="amount" type="number" min="0" step="0.01" inputmode="decimal" required>
+      <div class="row g-2 mt-1 mb-3">
+        <div class="col-6"><label class="form-label">Method</label>
+          <select class="form-select" name="method"><option value="cash">Cash</option><option value="bank">Bank / wallet</option></select></div>
+        <div class="col-6"><label class="form-label">Date</label>
+          <input class="form-control" name="date" type="date" value="${today()}"></div>
+      </div>
+      <label class="form-label">Note</label><input class="form-control" name="note" placeholder="Optional" maxlength="200">`,
+    onSubmit: (v) => Gas.savePayment({ partyType: type, partyId: party.id, amount: v.amount, method: v.method, date: v.date || today(), note: v.note }),
   });
-  if (r === undefined || r === null) return r;
-  return r.value || r; // created parties are returned directly
+  return ok;
 }
 
-async function renderList(el, kind) {
-  const [one, many, balLabel] = LABEL[kind];
-  const $el = $(el);
-  $el.html(UI.pageHeader(many, canEdit(kind) ? `<button class="btn btn-primary btn-sm btn-add"><i class="bi bi-plus-lg"></i> Add</button>` : '') + `
-    <div class="filters"><input type="search" class="form-control flex-grow-2 q" placeholder="Search ${many.toLowerCase()}…">
-      <select class="form-select f-status"><option value="active">Active</option><option value="balance">With balance</option><option value="inactive">Inactive</option><option value="all">All</option></select></div>
-    <div class="small text-body-secondary mb-2 summary"></div>
-    <div class="list-card list"></div>`);
-  const bal = await Posting.allBalances();
-  const debitNormal = kind === 'customers';
-  const draw = () => {
-    const q = $el.find('.q').val().toLowerCase();
-    const f = $el.find('.f-status').val();
-    const list = Catalog.allParties(kind).filter((p) => {
-      const b = bal.get(Posting.partyAccount(kind, p.id))?.balance || 0;
-      if (f === 'active' && !p.active) return false;
-      if (f === 'inactive' && p.active) return false;
-      if (f === 'balance' && Math.abs(b) < 0.005) return false;
-      return !q || `${p.name} ${p.phone} ${p.email}`.toLowerCase().includes(q);
-    }).sort((a, b) => a.name.localeCompare(b.name));
-    const total = list.reduce((s, p) => s + (bal.get(Posting.partyAccount(kind, p.id))?.balance || 0), 0);
-    $el.find('.summary').html(`${list.length} ${many.toLowerCase()} · Total ${balLabel.toLowerCase()}: <b>${balText(total, debitNormal)}</b>`);
-    pager($el.find('.list'), list, (p) => {
-      const b = bal.get(Posting.partyAccount(kind, p.id))?.balance || 0;
-      return `<a class="list-row" href="#/${kind}/${encodeURIComponent(p.id)}">
-        ${UI.avatar(p.name, 'round')}
-        <div class="main"><div class="title">${esc(p.name)} ${p.active ? '' : '<span class="badge text-bg-secondary">Inactive</span>'}</div><div class="sub">${esc(p.phone || p.email || '—')}</div></div>
-        <div class="end"><div class="fw-semibold money ${Math.abs(b) > 0.005 ? '' : 'text-body-secondary'}">${balText(b, debitNormal)}</div></div></a>`;
-    }, 50, UI.emptyState(`No ${many.toLowerCase()} found`, 'people', canEdit(kind) ? `<button class="btn btn-primary btn-sm mt-3 btn-add">Add ${one.toLowerCase()}</button>` : ''));
+// ---------- List ----------
+async function renderList(el, type, setTitle) {
+  const L = LABEL[type];
+  const store = type === 'customer' ? 'customers' : 'suppliers';
+  const [rows, dues] = await Promise.all([read([store], (t) => t.getAll(store)), Gas.partyDues()]);
+  const sorted = rows.sort((a, b) => lc(a.name).localeCompare(lc(b.name)));
+  setTitle(L.many);
+  const owed = round2(rows.reduce((a, r) => a + Math.max(0, dues.get(r.id) || 0), 0));
+  const canEdit = type === 'customer' ? Auth.can('customer.edit') : Auth.can('supplier.manage');
+
+  el.innerHTML = `
+  <div class="anim-rise">
+    ${pageHeader(L.many, canEdit ? `<button class="btn btn-grad btn-sm" id="p-add"><i class="bi bi-plus-lg me-1"></i>Add ${L.one.toLowerCase()}</button>` : '')}
+    <div class="summary-strip card-lift mb-3">
+      <div><div class="small text-body-secondary">${type === 'customer' ? 'Total to collect' : 'Total you owe'}</div>
+        <div class="fs-4 fw-bold ${type === 'customer' ? 'text-success' : 'text-danger'}">${esc(cur())} ${f2(owed)}</div></div>
+      <div class="text-end small text-body-secondary">${rows.length} ${rows.length === 1 ? L.one.toLowerCase() : L.many.toLowerCase()}</div>
+    </div>
+    <div class="search-box mb-2"><i class="bi bi-search"></i>
+      <input type="search" class="form-control" id="p-q" placeholder="Search name or phone" autocomplete="off"></div>
+    <div class="card-lift p-0 overflow-hidden" id="p-list"></div>
+  </div>`;
+
+  const draw = (q) => {
+    const qq = lc(q); const digits = (q || '').trim();
+    const list = sorted.filter((r) => !qq || r.nameLc.includes(qq) || (r.phone || '').includes(digits));
+    listPager(window.jQuery(el).find('#p-list'), list, (r) => {
+      const d = round2(dues.get(r.id) || 0);
+      const badge = d > 0.004 ? `<span class="badge ${type === 'customer' ? 'text-bg-warning' : 'text-bg-danger'}">${esc(cur())} ${f2(d)}</span>`
+        : d < -0.004 ? `<span class="badge text-bg-info">Credit ${esc(cur())} ${f2(-d)}</span>`
+        : `<span class="badge text-bg-light border">${L.ok}</span>`;
+      return `<a class="list-row" href="#/${type === 'customer' ? 'customers' : 'suppliers'}/${encodeURIComponent(r.id)}">
+        ${avatar(r.name, 'avatar-md')}
+        <div class="flex-grow-1 min-w-0"><div class="fw-semibold text-truncate">${esc(r.name)}</div>
+        <div class="small text-body-secondary text-truncate">${esc(r.phone || r.address || '—')}</div></div>
+        <div class="text-end">${badge}</div></a>`;
+    }, 50, emptyState(q ? 'No matches' : `No ${L.many.toLowerCase()} yet`, type === 'customer' ? 'people' : 'building'));
   };
-  draw();
-  $el.on('input', '.q', debounce(draw, 150));
-  $el.on('change', '.f-status', draw);
-  $el.on('click', '.btn-add', async () => { const p = await editParty(kind); if (p) location.hash = `#/${kind}/${p.id}`; });
-}
-
-async function renderDetail(el, kind, id) {
-  const [one, many, balLabel] = LABEL[kind];
-  const $el = $(el).off();
-  const p = Catalog.party(kind, id);
-  if (!p) { $el.html(UI.pageHeader(one, '', `#/${kind}`) + UI.emptyState(`${one} not found`, 'person-x')); return; }
-  const acc = Posting.partyAccount(kind, id);
-  const debitNormal = kind === 'customers';
-  let from = monthStart(); let to = today();
-  const payType = kind === 'customers' ? 'receipt' : 'payment';
-  const canPay = Auth.can(payType === 'receipt' ? 'voucher.create' : 'account.manage');
-  $el.html(UI.pageHeader(p.name, `
-      ${canEdit(kind) ? `<button class="btn btn-light btn-sm btn-edit" title="Edit"><i class="bi bi-pencil"></i></button>` : ''}
-      ${Auth.can('party.delete') ? `<button class="btn btn-light btn-sm btn-del" title="Delete"><i class="bi bi-trash"></i></button>` : ''}`, `#/${kind}`) + `
-    <div class="card stat-card mb-3"><div class="card-body d-flex flex-wrap align-items-center gap-3">
-      <div class="flex-grow-1"><div class="stat-label">${balLabel} balance</div><div class="stat-value money bal"></div>
-        <div class="small text-body-secondary">${esc([p.phone, p.email, p.address].filter(Boolean).join(' · ') || 'No contact details')}</div></div>
-      <div class="d-flex gap-2 flex-wrap">
-        ${canPay ? `<button class="btn btn-success btn-pay"><i class="bi bi-cash-coin me-1"></i>${kind === 'customers' ? 'Receive payment' : 'Make payment'}</button>` : ''}
-        ${kind === 'customers' && Auth.can('sale.create') ? `<button class="btn btn-outline-primary btn-sell"><i class="bi bi-cart-plus me-1"></i>New sale</button>` : ''}
-        <button class="btn btn-outline-secondary btn-print"><i class="bi bi-printer me-1"></i>Statement</button>
-      </div></div></div>
-    ${p.active ? '' : '<div class="alert alert-secondary py-2">This account is inactive.</div>'}
-    <h2 class="h6">Ledger</h2>
-    ${dateFilter(from, to)}
-    <div class="card"><div class="card-body p-0 ledger"></div></div>`);
-  let led;
-  const load = async () => {
-    const total = await Posting.accountBalance(acc);
-    $el.find('.bal').html(balText(total, debitNormal));
-    led = await Posting.ledger(acc, from, to);
-    $el.find('.ledger').html(ledgerTable(led, { debitNormal }));
-  };
-  await load();
-  bindDateFilter($el, (f, t) => { from = f; to = t; load(); });
-  $el.on('click', '.btn-edit', async () => { if (await editParty(kind, Catalog.party(kind, id))) renderDetail(el, kind, id); });
-  $el.on('click', '.btn-del', async () => {
-    if (!await UI.confirmDialog(`Delete ${p.name}? If there are transactions, the ${one.toLowerCase()} will be deactivated instead.`, { okLabel: 'Delete', okClass: 'btn-danger' })) return;
-    try { const r = await Posting.deleteParty(kind, id); UI.toast(r === 'deleted' ? `${one} deleted` : `${one} deactivated (has transactions)`); location.hash = `#/${kind}`; } catch (e) { UI.toastError(e); }
-  });
-  $el.on('click', '.btn-pay', async () => {
-    const { newVoucher } = await import('./vouchers.js');
-    if (await newVoucher({ type: payType, counterAccountId: acc })) load();
-  });
-  $el.on('click', '.btn-sell', () => {
-    const key = storageKey('draft.sale');
-    localStorage.setItem(key, JSON.stringify({ ...JSON.parse(localStorage.getItem(key) || '{}'), mode: 'sale', partyId: id, partyName: p.name }));
-    location.hash = '#/pos';
-  });
-  $el.on('click', '.btn-print', () => {
-    const b = getSettings().business;
-    printHTML(`<div class="print-report"><h2>${esc(b.name)}</h2><div>${esc(one)} statement: <b>${esc(p.name)}</b> ${esc(p.phone || '')}</div>
-      <div>Period: ${esc(from)} to ${esc(to)}</div><br>${ledgerTable(led, { debitNormal })}</div>`, { page: 'A4' });
+  draw('');
+  el.querySelector('#p-q').addEventListener('input', debounce((e) => draw(e.target.value), 120));
+  el.querySelector('#p-add')?.addEventListener('click', async () => {
+    const r = await openPartyForm(type);
+    if (r) { UI.toast(`${L.one} added`); renderList(el, type, setTitle); }
   });
 }
 
-export default {
-  async render(el, { route, params, setTitle }) {
-    const kind = route;
-    if (params[0]) {
-      await renderDetail(el, kind, params[0]);
-      setTitle(LABEL[kind][0]);
-    } else await renderList(el, kind);
-  },
-};
+// ---------- Ledger ----------
+async function renderLedger(el, type, id, setTitle) {
+  const { party, opening, rows, closing } = await Gas.partyLedger(type, id);
+  setTitle(party.name);
+  const canPay = type === 'customer' ? Auth.can('payment.collect') : Auth.can('purchase.manage');
+  const canEdit = type === 'customer' ? Auth.can('customer.edit') : Auth.can('supplier.manage');
+  const owes = closing > 0.004;
+  const credit = closing < -0.004;
+
+  const body = rows.length ? rows.map((r) => `<tr>
+      <td class="text-nowrap">${fmtDate(r.date)}</td>
+      <td>${r.route ? `<a href="${r.route}">${esc(r.ref)}</a>` : esc(r.ref || '')}
+        <div class="small text-body-secondary">${esc(r.label)}${r.note ? ` · ${esc(r.note)}` : ''}</div></td>
+      <td class="num">${r.inc ? f2(r.inc) : ''}</td>
+      <td class="num">${r.dec ? f2(r.dec) : ''}</td>
+      <td class="num fw-semibold">${f2(r.balance)}</td></tr>`).join('')
+    : `<tr><td colspan="5" class="text-center text-body-secondary py-4">No transactions yet</td></tr>`;
+
+  el.innerHTML = `
+  <div class="anim-rise">
+    ${pageHeader(party.name, canEdit ? '<button class="btn btn-light btn-sm" id="l-edit"><i class="bi bi-pencil"></i></button>' : '', type === 'customer' ? '#/customers' : '#/suppliers')}
+    <section class="ledger-hero card-lift mb-3 ${owes ? 'is-owed' : credit ? 'is-credit' : ''}">
+      <div class="d-flex flex-wrap justify-content-between gap-3">
+        <div>
+          <div class="small text-body-secondary">${owes ? (type === 'customer' ? 'Balance to collect' : 'You owe') : credit ? 'Credit held' : 'Settled'}</div>
+          <div class="ledger-amt" data-count="${round2(Math.abs(closing))}" data-fmt="money">${esc(cur())} ${f2(Math.abs(closing))}</div>
+          <div class="small text-body-secondary">${esc(party.phone || '')}${party.phone && party.address ? ' · ' : ''}${esc(party.address || '')}</div>
+        </div>
+        ${canPay ? `<div class="d-flex flex-column gap-2 align-self-center">
+          <button class="btn ${type === 'customer' ? 'btn-success' : 'btn-danger'} btn-pay" id="l-pay"><i class="bi bi-${type === 'customer' ? 'cash-stack' : 'send'} me-1"></i>${type === 'customer' ? 'Receive payment' : 'Pay supplier'}</button>
+        </div>` : ''}
+      </div>
+    </section>
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div class="section-title mb-0"><i class="bi bi-journal-text"></i> Statement</div>
+      <button class="btn btn-light btn-sm" id="l-print"><i class="bi bi-printer me-1"></i>Print</button>
+    </div>
+    <div class="card-lift p-0 overflow-hidden">
+      <div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0 statement">
+        <thead><tr><th>Date</th><th>Ref</th><th class="num">${type === 'customer' ? 'Charged' : 'Bought'}</th><th class="num">${type === 'customer' ? 'Received' : 'Paid'}</th><th class="num">Balance</th></tr></thead>
+        <tbody><tr class="table-light"><td colspan="4">Opening balance</td><td class="num fw-semibold">${f2(opening)}</td></tr>${body}</tbody>
+      </table></div>
+    </div>
+  </div>`;
+
+  UI.countUp(el, (n) => `${cur()} ${f2(n)}`);
+  const $el = window.jQuery(el);
+  $el.find('#l-pay').on('click', async () => {
+    const ok = await paymentForm(type, party);
+    if (ok) { UI.toast(type === 'customer' ? 'Payment received' : 'Payment recorded'); renderLedger(el, type, id, setTitle); }
+  });
+  $el.find('#l-edit').on('click', async () => {
+    const r = await openPartyForm(type, party);
+    if (r) { UI.toast('Saved'); renderLedger(el, type, id, setTitle); }
+  });
+  $el.find('#l-print').on('click', () => printStatement(type, party, opening, rows, closing));
+}
+
+function printStatement(type, party, opening, rows, closing) {
+  const body = rows.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${esc(r.label)} ${esc(r.ref || '')}</td>
+      <td class="num">${r.inc ? plainNum(r.inc) : ''}</td><td class="num">${r.dec ? plainNum(r.dec) : ''}</td><td class="num">${plainNum(r.balance)}</td></tr>`).join('');
+  printHtml(`<div class="receipt wide">${shopHeader()}
+    <div class="pr-meta"><div><b>Statement: ${esc(party.name)}</b></div><div>As of ${fmtDate(today())}</div></div>
+    <table class="pr-table"><thead><tr><th>Date</th><th>Ref</th><th class="num">Charged</th><th class="num">Received</th><th class="num">Balance</th></tr></thead>
+    <tbody><tr><td colspan="4">Opening balance</td><td class="num">${plainNum(opening)}</td></tr>${body}
+    <tr class="pr-grand"><td colspan="4">Closing balance</td><td class="num">${plainNum(closing)}</td></tr></tbody></table></div>`,
+  `Statement ${party.name}`);
+}
+
+export async function render(el, { route, params, setTitle }) {
+  const type = route === 'suppliers' ? 'supplier' : 'customer';
+  if (params[0]) return renderLedger(el, type, params[0], setTitle);
+  return renderList(el, type, setTitle);
+}
 

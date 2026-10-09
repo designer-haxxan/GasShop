@@ -19,11 +19,13 @@ const ERRORS = {
 };
 const GENERIC = 'Login failed. Try again.';
 
-export const ROLES = { admin: 'Owner', manager: 'Manager', cashier: 'Cashier' };
+export const ROLES = { admin: 'Owner', manager: 'Manager', cashier: 'Counter Staff' };
 
-const CASHIER = ['sale.create', 'party.edit', 'voucher.create', 'reports.view'];
-const MANAGER = [...CASHIER, 'sale.edit', 'sale.void', 'sale.return', 'purchase.manage', 'product.edit', 'product.delete',
-  'party.delete', 'voucher.void', 'account.manage', 'stock.adjust', 'reports.profit', 'settings.manage', 'backup.export'];
+// Counter staff: refills, exchanges, accessory sales, customer payments.
+const CASHIER = ['sale.create', 'customer.edit', 'payment.collect', 'reports.view'];
+// Manager: purchases, stock and tank adjustments, accessories, expenses, voids and finance reports.
+const MANAGER = [...CASHIER, 'sale.void', 'purchase.manage', 'stock.adjust', 'item.manage', 'supplier.manage',
+  'expense.manage', 'reports.finance', 'settings.manage', 'backup.export'];
 const PERMISSIONS = { cashier: CASHIER, manager: MANAGER, admin: ['*'] };
 
 let current = null;

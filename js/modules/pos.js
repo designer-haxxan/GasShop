@@ -1,467 +1,433 @@
-// Fast POS screen used for both sales (#/pos) and purchases (#/purchase/new). Edit: #/pos/edit/:id, #/purchase/edit/:id
-import * as idb from '../db/idb.js';
+// Counter sale: gas refills (customer's own cylinder, billed per kg), cylinder swaps (full out, empty in)
+// and accessories. The cart is kept as a draft on this device, so a page refresh does not lose it.
+import { read } from '../db/idb.js';
+import { esc, fmtNum, fmtQty, num, round2, round3, today, lc, fmtDate } from '../core/utils.js';
+import { getSettings, cylinderType, pref } from '../core/settings.js';
+import { printHtml, receiptHtml } from '../core/print.js';
 import * as UI from '../core/ui.js';
-import { esc, fmtNum, fmtQty, uuid, round2, round3, num, debounce, today, AppError } from '../core/utils.js';
-import { getSettings, pref } from '../core/settings.js';
-import { storageKey } from '../config.js';
-import * as Auth from '../services/auth.js';
-import * as Catalog from '../services/catalog.js';
-import * as Posting from '../services/posting.js';
-import * as Printer from '../printer/printer.js';
-import * as Scanner from '../scanner/scanner.js';
-import { partyPicker } from './parties.js';
+import * as Gas from '../services/gas.js';
+import { openPartyForm } from './parties.js';
 
-const $ = window.jQuery;
-let st; let $root; let detachWedge = null; let payAccounts = [];
-
-const isSale = () => st.mode === 'sale';
-const draftKey = () => storageKey('draft.' + st.mode);
 const cur = () => getSettings().currency;
+const f2 = (n) => fmtNum(n);
+const DRAFT = 'posDraft';
 
-function fresh(mode) {
-  return { mode, id: uuid(), editId: null, date: today(), partyId: null, partyName: '', lines: [], discount: 0, note: '', refNo: '', tendered: null, priceMode: pref.get('priceMode', 'retail') };
+let state = null;
+let stockView = { cyl: [], items: [], gasKg: 0 };
+let root = null;
+
+function freshState() {
+  return { customer: null, lines: [], discount: 0, paid: null, method: 'cash' };
 }
-function persist() { if (!st.editId) localStorage.setItem(draftKey(), JSON.stringify(st)); }
-function taxRate() {
-  if (!isSale()) return 0;
-  if (st.editId) return st.taxRate || 0;
-  const s = getSettings(); return s.taxEnabled ? num(s.taxRate) : 0;
+
+// ---------- Line maths ----------
+function lineAmount(l) {
+  if (l.kind === 'refill') return round2(l.qty * (cylinderType(l.typeId)?.kg || 0) * l.rate);
+  if (l.kind === 'cyl') return round2(l.out * l.rate);
+  return round2(l.qty * l.rate);
 }
+function lineKg(l) { return round3(l.qty * (cylinderType(l.typeId)?.kg || 0)); }
+
 function totals() {
-  return Posting.previewDoc(st.lines, st.discount, taxRate()) || { subtotal: 0, discount: 0, tax: 0, total: 0, qtyTotal: 0, lines: [] };
+  const sub = round2(state.lines.reduce((a, l) => a + lineAmount(l), 0));
+  const disc = Math.min(Math.max(round2(num(state.discount)), 0), sub);
+  const total = round2(sub - disc);
+  const paid = state.paid === null ? total : Math.min(Math.max(round2(num(state.paid)), 0), total);
+  return { sub, disc, total, paid, due: round2(total - paid) };
 }
 
-// ---------- rendering ----------
-function layout() {
-  const sale = isSale();
-  return `<div class="pos">
-    <div class="pos-left">
-      <div class="d-flex gap-2 mb-2">
-        <input type="search" class="form-control browse-q" placeholder="Filter products…" autocomplete="off">
-        <button class="btn btn-light d-lg-none btn-close-browse" aria-label="Close"><i class="bi bi-x-lg"></i></button>
+function saveDraft() {
+  pref.set(DRAFT, state);
+}
+
+// ---------- Rendering ----------
+function renderTiles() {
+  const s = getSettings();
+  const cyl = (id) => stockView.cyl.find((c) => c.id === id) || { full: 0, empty: 0 };
+  root.querySelector('#pos-refill').innerHTML = s.cylinderTypes.map((t) => `
+    <button type="button" class="tile tile-refill card-lift" data-refill="${esc(t.id)}">
+      <span class="tile-ico"><i class="bi bi-fire"></i></span>
+      <span class="tile-name">${esc(t.name)}</span>
+      <span class="tile-sub">${fmtQty(t.kg)} kg · ${esc(cur())} ${f2(s.gasRate * t.kg)}</span>
+    </button>`).join('') || UI.emptyState('Add cylinder types in Settings.', 'fuel-pump');
+
+  root.querySelector('#pos-swap').innerHTML = s.cylinderTypes.map((t) => {
+    const c = cyl(t.id);
+    return `<button type="button" class="tile tile-swap card-lift ${c.full <= 0 ? 'is-out' : ''}" data-swap="${esc(t.id)}">
+      <span class="tile-ico"><i class="bi bi-arrow-left-right"></i></span>
+      <span class="tile-name">${esc(t.name)}</span>
+      <span class="tile-sub">${esc(cur())} ${f2(t.price)} · <b>${c.full}</b> full</span>
+    </button>`;
+  }).join('') || UI.emptyState('Add cylinder types in Settings.', 'fuel-pump');
+
+  root.querySelector('#pos-tank').textContent = `${fmtQty(stockView.gasKg)} kg in tank`;
+}
+
+function renderCustomer() {
+  const c = state.customer;
+  root.querySelector('#pos-customer').innerHTML = `
+    <span class="avatar-sm tint-${c ? 'indigo' : 'slate'}"><i class="bi bi-${c ? 'person-fill' : 'person'}"></i></span>
+    <span class="flex-grow-1 min-w-0 text-start">
+      <span class="d-block small text-body-secondary">Customer</span>
+      <span class="d-block fw-semibold text-truncate">${esc(c ? c.name : 'Walk-in')}</span>
+    </span>
+    <span class="btn btn-sm btn-outline-secondary">${c ? 'Change' : 'Choose'}</span>`;
+}
+
+function lineRowHtml(l, i) {
+  const t = cylinderType(l.typeId);
+  let icon = 'bag'; let sub = '';
+  let controls = '';
+  if (l.kind === 'refill') {
+    icon = 'fire';
+    sub = `${fmtQty(lineKg(l))} kg of gas`;
+    controls = stepper(i, 'qty', l.qty);
+  } else if (l.kind === 'cyl') {
+    icon = 'arrow-left-right';
+    sub = `Give ${l.out} full · take back ${l.in} empty`;
+    controls = `<div class="d-flex flex-column gap-1">${stepper(i, 'out', l.out, 'Full out')}${stepper(i, 'in', l.in, 'Empty in')}</div>`;
+  } else {
+    sub = `${esc(l.name)}`;
+    controls = stepper(i, 'qty', l.qty);
+  }
+  const name = l.kind === 'item' ? l.name : (t?.name || l.name);
+  return `<div class="cart-line anim-slide" style="--d:${i * 0.03}s">
+    <div class="cart-ico tone-${l.kind === 'item' ? 'blue' : l.kind === 'refill' ? 'flame' : 'violet'}"><i class="bi bi-${icon}"></i></div>
+    <div class="flex-grow-1 min-w-0">
+      <div class="fw-semibold text-truncate">${esc(name)}</div>
+      <div class="small text-body-secondary">${sub}</div>
+      <div class="d-flex align-items-center gap-2 flex-wrap mt-1">${controls}
+        <label class="rate-field small text-body-secondary">${l.kind === 'refill' ? 'per kg' : 'rate'}
+          <input type="number" min="0" step="0.01" inputmode="decimal" class="form-control form-control-sm" data-rate="${i}" value="${l.rate}"></label>
       </div>
-      <div class="chips mb-2 cat-chips"></div>
-      <div class="product-grid"></div>
     </div>
-    <div class="pos-right">
-      <div class="pos-search">
-        <div class="input-group input-group-lg">
-          <span class="input-group-text bg-body"><i class="bi bi-search"></i></span>
-          <input type="search" class="form-control pos-q" placeholder="Search or scan product" autocomplete="off" enterkeyhint="search" aria-label="Search product">
-          <button class="btn btn-outline-secondary btn-scan" title="Scan with camera" aria-label="Scan barcode"><i class="bi bi-upc-scan"></i></button>
-          <button class="btn btn-outline-secondary btn-browse d-lg-none" title="Browse products" aria-label="Browse"><i class="bi bi-grid-3x3-gap"></i></button>
-        </div>
-        <div class="search-results d-none"></div>
-      </div>
-      <div class="pos-meta">
-        <button class="btn btn-light btn-party text-truncate"><i class="bi bi-person me-1"></i><span class="party-name"></span></button>
-        ${sale ? `<button class="btn btn-light flex-grow-0 btn-holds" title="Held sales"><i class="bi bi-pause-circle"></i> <span class="badge text-bg-secondary holds-count"></span></button>` : ''}
-        <div class="dropdown flex-grow-0">
-          <button class="btn btn-light" data-bs-toggle="dropdown" aria-label="More options"><i class="bi bi-three-dots-vertical"></i></button>
-          <ul class="dropdown-menu dropdown-menu-end">
-            ${sale ? `<li><button class="dropdown-item btn-hold"><i class="bi bi-pause-circle me-2"></i>Hold this sale</button></li>
-            <li><button class="dropdown-item btn-price-mode"><i class="bi bi-tags me-2"></i>Use <span class="pm-label"></span> prices</button></li>` : ''}
-            <li><button class="dropdown-item btn-scan-cont"><i class="bi bi-upc-scan me-2"></i>Continuous scan</button></li>
-            <li><button class="dropdown-item btn-quick-add"><i class="bi bi-plus-square me-2"></i>Add new product</button></li>
-            <li><hr class="dropdown-divider"></li>
-            <li><button class="dropdown-item text-danger btn-clear"><i class="bi bi-trash me-2"></i>${st.editId ? 'Cancel editing' : 'Clear cart'}</button></li>
-          </ul>
-        </div>
-      </div>
-      ${st.editId ? `<div class="alert alert-warning rounded-0 m-0 py-1 px-3 small"><i class="bi bi-pencil me-1"></i>Editing ${esc(st.editNumber)}</div>` : ''}
-      <div class="pos-lines"></div>
-      <div class="pos-footer">
-        <div class="d-flex justify-content-between small text-body-secondary footer-sub"></div>
-        <div class="d-flex align-items-center gap-2 mt-1">
-          <div class="flex-grow-1"><div class="small text-body-secondary">Total</div><div class="total money"></div></div>
-          <button class="btn btn-primary btn-pay"><i class="bi bi-${sale ? 'cash-coin' : 'bag-check'} me-1"></i>${sale ? 'Pay' : 'Save'}</button>
-        </div>
-      </div>
+    <div class="text-end">
+      <div class="fw-bold">${esc(cur())} ${f2(lineAmount(l))}</div>
+      <button type="button" class="btn btn-link btn-sm text-danger p-0 mt-1" data-remove="${i}" aria-label="Remove"><i class="bi bi-x-lg"></i></button>
     </div>
   </div>`;
 }
 
-function renderLines() {
-  const s = getSettings();
-  const $l = $root.find('.pos-lines');
-  if (!st.lines.length) {
-    $l.html(UI.emptyState(isSale() ? 'Cart is empty. Search, scan or browse to add products.' : 'No products yet. Search or scan to add purchased items.', 'cart'));
-  } else {
-    $l.html(st.lines.map((l, i) => {
-      const p = Catalog.product(l.productId);
-      const low = isSale() && !st.editId && p && p.trackStock !== false && !s.allowNegativeStock && l.qty > (p.stock || 0);
-      const amt = round2(l.qty * l.rate - (l.discount || 0));
-      return `<div class="cart-line" data-i="${i}">
-        <div class="info btn-line" role="button" tabindex="0">
-          <div class="name">${esc(l.name)}</div>
-          <div class="meta">${fmtNum(l.rate)}${l.discount ? ` · disc ${fmtNum(l.discount)}` : ''}${p && p.trackStock !== false ? ` · <span class="${low ? 'text-danger fw-semibold' : ''}">stock ${fmtQty(p.stock)}</span>` : ''}</div>
-        </div>
-        <div class="qty-ctl"><button class="btn-dec" aria-label="Decrease">−</button><input class="qty-in" inputmode="decimal" value="${fmtQty(l.qty).replace(/,/g, '')}" aria-label="Quantity"><button class="btn-inc" aria-label="Increase">+</button></div>
-        <div class="amt money">${fmtNum(amt)}</div>
-      </div>`;
-    }).join(''));
-  }
-  renderTotals();
+function stepper(i, field, value, label = '') {
+  return `<div class="stepper" role="group" aria-label="${esc(label || field)}">
+    ${label ? `<span class="stepper-label">${label}</span>` : ''}
+    <button type="button" class="btn btn-light btn-sm" data-step="${i}" data-field="${field}" data-d="-1" aria-label="Less">−</button>
+    <span class="stepper-val" aria-live="polite">${value}</span>
+    <button type="button" class="btn btn-light btn-sm" data-step="${i}" data-field="${field}" data-d="1" aria-label="More">+</button>
+  </div>`;
 }
 
-function renderTotals() {
+function renderCart() {
+  const list = root.querySelector('#pos-lines');
+  list.innerHTML = state.lines.length
+    ? state.lines.map(lineRowHtml).join('')
+    : `<div class="cart-empty"><div class="cart-empty-ico"><i class="bi bi-basket"></i></div>
+        <div class="fw-semibold">Cart is empty</div>
+        <div class="small text-body-secondary">Tap a refill, a swap or an accessory to add it.</div></div>`;
+  root.querySelector('#pos-count').textContent = state.lines.length ? `${state.lines.length} item${state.lines.length === 1 ? '' : 's'}` : '';
+  renderSummary();
+}
+
+function renderSummary() {
   const t = totals();
-  $root.find('.total').text(`${cur()} ${fmtNum(t.total)}`);
-  $root.find('.footer-sub').html(`<span>${st.lines.length} item(s) · qty ${fmtQty(t.qtyTotal)}</span><span>${t.discount ? `Disc ${fmtNum(t.discount)} · ` : ''}${t.tax ? `Tax ${fmtNum(t.tax)}` : ''}</span>`);
-  $root.find('.btn-pay').prop('disabled', !st.lines.length);
-  $root.find('.party-name').text(st.partyName || (isSale() ? 'Walk-in Customer' : 'Select supplier'));
-  $root.find('.pm-label').text(st.priceMode === 'retail' ? 'wholesale' : 'retail');
-  persist();
+  root.querySelector('#pos-sub').textContent = `${cur()} ${f2(t.sub)}`;
+  root.querySelector('#pos-total').textContent = `${cur()} ${f2(t.total)}`;
+  root.querySelector('#pos-discount').value = state.discount || '';
+  const paidEl = root.querySelector('#pos-paid');
+  if (document.activeElement !== paidEl) paidEl.value = t.paid;
+  root.querySelector('#pos-due').textContent = t.due > 0.004 ? `${cur()} ${f2(t.due)} on credit` : 'Fully paid';
+  root.querySelector('#pos-due').className = `badge rounded-pill ${t.due > 0.004 ? 'text-bg-warning' : 'text-bg-success'}`;
+  root.querySelectorAll('[data-method]').forEach((b) => b.classList.toggle('active', b.dataset.method === state.method));
+  root.querySelector('#pos-save').disabled = !state.lines.length;
+  root.querySelector('#pos-save-print').disabled = !state.lines.length;
+  root.querySelector('#pos-paid-full').classList.toggle('d-none', state.paid === null);
+  saveDraft();
 }
 
-async function renderHoldCount() {
-  if (!isSale()) return;
-  const n = await idb.count('holds');
-  $root.find('.holds-count').text(n || '');
+function refreshAll() { renderCustomer(); renderCart(); }
+
+// ---------- Adding lines ----------
+function addLine(line) {
+  const same = state.lines.find((l) => l.kind === line.kind && (l.typeId || l.itemId) === (line.typeId || line.itemId));
+  if (same) {
+    if (line.kind === 'cyl') { same.out += line.out; same.in += line.in; } else same.qty += line.qty;
+  } else state.lines.push(line);
+  refreshAll();
 }
 
-// ---------- browse grid ----------
-let browseCat = null;
-function renderGrid() {
-  const q = $root.find('.browse-q').val() || '';
-  const list = Catalog.searchProducts(q, { limit: 120, categoryId: browseCat });
-  const cats = Catalog.allCategories();
-  $root.find('.cat-chips').html(`<span class="chip ${!browseCat ? 'active' : ''}" data-cat="">All</span>` + cats.map((c) => `<span class="chip ${browseCat === c.id ? 'active' : ''}" data-cat="${esc(c.id)}">${esc(c.name)}</span>`).join(''));
-  $root.find('.product-grid').html(list.length ? list.map((p) => `
-    <button class="product-tile" data-id="${esc(p.id)}">
-      ${p.image ? `<img src="${p.image}" alt="" loading="lazy">` : `<div class="ph tint-${UI.tintFor(p.name)}">${esc(UI.initials(p.name))}</div>`}
-      <div class="n">${esc(p.name)}</div>
-      <div class="p">${fmtNum(priceOf(p))}</div>
-      ${p.trackStock !== false ? `<div class="s">Stock: ${fmtQty(p.stock)}</div>` : ''}
-    </button>`).join('') : UI.emptyState('No products', 'box'));
-}
-
-// ---------- cart operations ----------
-function priceOf(p) {
-  if (!isSale()) return p.purchasePrice || 0;
-  return st.priceMode === 'wholesale' && p.wholesalePrice ? p.wholesalePrice : p.salePrice || 0;
-}
-
-function addProduct(p, qty = 1) {
-  if (!p) return;
-  if (!p.active) { UI.toast(`"${p.name}" is inactive`, 'warning'); return; }
-  const i = st.lines.findIndex((l) => l.productId === p.id && !l.discount);
-  if (i >= 0) {
-    st.lines[i].qty = round3(st.lines[i].qty + qty);
-    const [line] = st.lines.splice(i, 1); st.lines.unshift(line);
-  } else {
-    st.lines.unshift({ productId: p.id, name: p.name, unit: p.unit, qty, rate: priceOf(p), discount: 0 });
-  }
-  renderLines();
-  $root.find('.cart-line').first().addClass('bg-success-subtle');
-  setTimeout(() => $root.find('.cart-line').first().removeClass('bg-success-subtle'), 400);
-  const s = getSettings();
-  if (isSale() && !st.editId && p.trackStock !== false && !s.allowNegativeStock && st.lines[0].qty > (p.stock || 0)) UI.toast(`Only ${fmtQty(p.stock)} in stock for ${p.name}`, 'warning', 2500);
-}
-
-function addByCode(code) {
-  const p = Catalog.findByCode(code);
-  if (p) { UI.beep(); addProduct(p); return true; }
-  UI.toast(`No product found for "${code}"`, 'warning');
-  return false;
-}
-
-function hideResults() { $root.find('.search-results').addClass('d-none').empty(); }
-
-let results = [];
-const doSearch = debounce(() => {
-  const q = $root.find('.pos-q').val().trim();
-  if (!q) return hideResults();
-  results = Catalog.searchProducts(q, { limit: 25 });
-  $root.find('.search-results').removeClass('d-none').html(results.length ? results.map((p, i) => `
-    <button class="list-row ${i === 0 ? 'bg-body-secondary' : ''}" data-i="${i}">
-      <div class="main"><div class="title">${esc(p.name)}</div><div class="sub">${esc([p.sku, p.barcode].filter(Boolean).join(' · '))}</div></div>
-      <div class="end"><div class="fw-semibold money">${fmtNum(priceOf(p))}</div>${p.trackStock !== false ? `<div class="sub">stock ${fmtQty(p.stock)}</div>` : ''}</div>
-    </button>`).join('') : `<div class="p-3 text-body-secondary small">No products match "${esc(q)}".${Auth.can('product.edit') ? ' <a href="#" class="quick-add-link">Add new product</a>' : ''}</div>`);
-}, 120);
-
-async function editLine(i) {
-  const l = st.lines[i];
-  const p = Catalog.product(l.productId);
-  const r = await UI.formModal({
-    title: l.name, submitLabel: 'Update',
-    body: `<div class="row g-2">
-      <div class="col-4"><label class="form-label">Quantity</label><input name="qty" class="form-control form-control-lg" inputmode="decimal" value="${l.qty}"></div>
-      <div class="col-4"><label class="form-label">${isSale() ? 'Rate' : 'Cost rate'}</label><input name="rate" class="form-control form-control-lg" inputmode="decimal" value="${l.rate}"></div>
-      <div class="col-4"><label class="form-label">Discount</label><input name="discount" class="form-control form-control-lg" inputmode="decimal" value="${l.discount || 0}"></div>
-      ${p ? `<div class="col-12 small text-body-secondary">Sale ${fmtNum(p.salePrice)} · Wholesale ${fmtNum(p.wholesalePrice)} · Cost ${fmtNum(p.purchasePrice)}${p.trackStock !== false ? ` · Stock ${fmtQty(p.stock)}` : ''}</div>` : ''}
-      <div class="col-12"><button type="button" class="btn btn-outline-danger w-100 btn-remove-line"><i class="bi bi-trash me-1"></i>Remove item</button></div></div>`,
-    onShown: ($m) => { $m.find('[name=qty]').trigger('select'); $m.find('.btn-remove-line').on('click', () => { st.lines.splice(i, 1); renderLines(); $m.find('[data-bs-dismiss=modal]').first().trigger('click'); }); },
-    onSubmit: (v) => {
-      const qty = round3(num(v.qty)); const rate = round2(num(v.rate)); const discount = round2(num(v.discount));
-      if (!(qty > 0)) throw new AppError('Quantity must be greater than zero.');
-      if (rate < 0) throw new AppError('Rate cannot be negative.');
-      if (discount < 0 || discount > qty * rate) throw new AppError('Discount must be between 0 and the line amount.');
-      return { qty, rate, discount };
+async function addRefill(typeId) {
+  const t = cylinderType(typeId);
+  if (!t) return;
+  if (!(getSettings().gasRate > 0)) UI.toast('Set the gas price per kg in Settings first.', 'warning');
+  const v = await UI.formModal({
+    title: `Refill ${t.name}`, submitLabel: 'Add refill',
+    body: `${qtyField('Cylinders to refill', 1)}<div class="small text-body-secondary mt-2">${fmtQty(t.kg)} kg each · gas in tank: ${fmtQty(stockView.gasKg)} kg</div>`,
+    onSubmit: (vals) => {
+      const n = Math.round(num(vals.qty));
+      if (n <= 0) throw new Error('Enter at least one cylinder.');
+      const free = stockView.gasKg - refillKgExcept(-1);
+      if (free < n * t.kg) throw new Error(`Not enough gas in the tank: ${fmtQty(free)} kg left after this bill's other refills.`);
+      return { n };
     },
   });
-  if (r && st.lines[i] === l) { Object.assign(l, r); renderLines(); }
+  if (!v) return;
+  addLine({ kind: 'refill', typeId, name: t.name, qty: v.n, rate: getSettings().gasRate });
+  UI.toast(`Added ${v.n} × ${t.name} refill`, 'success', 1800);
 }
 
-async function choosePartyFn() {
-  const kind = isSale() ? 'customers' : 'suppliers';
-  const p = await partyPicker(kind, { noneLabel: isSale() ? 'Walk-in Customer' : 'No supplier (cash purchase)' });
-  if (p === undefined) return;
-  st.partyId = p?.id || null; st.partyName = p?.name || '';
-  renderTotals();
-}
-
-async function loadPayAccounts() {
-  payAccounts = (await idb.getAll('accounts')).filter((a) => ['cash', 'bank'].includes(a.type) && a.active).sort((a, b) => (a.id === 'cash' ? -1 : b.id === 'cash' ? 1 : a.name.localeCompare(b.name)));
-}
-
-// ---------- checkout ----------
-async function checkout() {
-  const t = Posting.previewDoc(st.lines, 0, 0);
-  if (!t) { UI.toast('Please fix invalid quantities/rates in the cart.', 'warning'); return; }
-  if (!st.lines.length) return;
-  const sale = isSale();
-  const s = getSettings();
-  const canDate = Auth.can(sale ? 'sale.edit' : 'purchase.manage');
-  const lastAcc = pref.get('payAccount', 'cash');
-  const m = UI.modal({
-    title: sale ? 'Payment' : 'Save purchase', static: true,
-    body: `<form class="checkout" autocomplete="off">
-      <div class="text-center mb-2"><div class="small text-body-secondary">Amount due</div><div class="checkout-total money co-total"></div></div>
-      <button type="button" class="btn btn-light w-100 mb-3 text-start co-party"><i class="bi bi-person me-2"></i><span></span><i class="bi bi-chevron-right float-end"></i></button>
-      <div class="row g-2 mb-2">
-        <div class="col-6"><label class="form-label">Bill discount</label><div class="input-group"><input name="discount" class="form-control" inputmode="decimal" value="${st.discount || ''}" placeholder="0"><button type="button" class="btn btn-outline-secondary co-pct" title="Discount as percent">%</button></div></div>
-        <div class="col-6"><label class="form-label">Pay via</label><select name="account" class="form-select">${UI.options(payAccounts, st.payAccount || lastAcc)}</select></div>
-      </div>
-      <div class="small text-body-secondary co-breakdown mb-2"></div>
-      <label class="form-label">${sale ? 'Amount received' : 'Amount paid'}</label>
-      <input name="tendered" class="form-control form-control-lg mb-2 money" inputmode="decimal" placeholder="0">
-      <div class="d-flex flex-wrap gap-2 pay-quick mb-2"></div>
-      <div class="alert py-2 mb-2 co-result"></div>
-      ${!sale ? `<div class="mb-2"><label class="form-label">Supplier invoice no.</label><input name="refNo" class="form-control" value="${esc(st.refNo)}"></div>` : ''}
-      <div class="row g-2">
-        ${canDate ? `<div class="col-6"><label class="form-label">Date</label><input type="date" name="date" class="form-control" value="${esc(st.date)}" max="${today()}"></div>` : ''}
-        <div class="${canDate ? 'col-6' : 'col-12'}"><label class="form-label">Note</label><input name="note" class="form-control" value="${esc(st.note)}"></div>
-      </div>
-      ${sale ? `<div class="form-check form-switch mt-3"><input class="form-check-input" type="checkbox" id="co-print" ${s.printer.autoPrint ? 'checked' : ''}><label class="form-check-label" for="co-print">Print receipt</label></div>` : ''}
-      <div class="alert alert-danger py-2 small d-none co-error mt-2 mb-0"></div>
-    </form>`,
-    footer: `<button class="btn btn-light" data-bs-dismiss="modal">Back</button><button class="btn btn-success btn-lg flex-grow-1 co-complete"><i class="bi bi-check2-circle me-1"></i>${sale ? 'Complete sale' : 'Save purchase'}</button>`,
+async function addSwap(typeId) {
+  const t = cylinderType(typeId);
+  if (!t) return;
+  const have = (stockView.cyl.find((c) => c.id === typeId) || { full: 0 }).full;
+  const v = await UI.formModal({
+    title: `Swap ${t.name}`, submitLabel: 'Add swap',
+    body: `${qtyField('Full cylinders given', 1)}
+      <div class="form-check mt-3"><input class="form-check-input" type="checkbox" name="takeEmpty" id="pos-take-empty" checked>
+      <label class="form-check-label" for="pos-take-empty">Customer hands in an empty one</label></div>
+      <div class="small text-body-secondary mt-2">${have} full in shop stock.</div>`,
+    onSubmit: (vals) => {
+      const n = Math.round(num(vals.qty));
+      if (n <= 0) throw new Error('Enter at least one cylinder.');
+      if (n > have) throw new Error(`Only ${have} full ${t.name} in stock.`);
+      return { n, take: !!vals.takeEmpty };
+    },
   });
-  const $m = m.$el;
-  let tenderedTouched = st.tendered !== null && st.editId;
-  const calc = () => Posting.previewDoc(st.lines, num($m.find('[name=discount]').val()), taxRate());
-  const update = () => {
-    const c = calc();
-    $m.find('.co-party span').text(st.partyName || (sale ? 'Walk-in Customer' : 'No supplier (cash purchase)'));
-    if (!c) { $m.find('.co-total').text('—'); $m.find('.co-result').attr('class', 'alert alert-danger py-2 mb-2 co-result').text('Discount cannot exceed the subtotal.'); $m.find('.co-complete').prop('disabled', true); return; }
-    $m.find('.co-total').text(`${cur()} ${fmtNum(c.total)}`);
-    $m.find('.co-breakdown').text(`Subtotal ${fmtNum(c.subtotal)}${c.discount ? ` − discount ${fmtNum(c.discount)}` : ''}${c.tax ? ` + tax ${fmtNum(c.tax)} (${c.taxRate}%)` : ''}`);
-    const $tin = $m.find('[name=tendered]');
-    if (!tenderedTouched) $tin.val(st.partyId ? (st.tendered ?? '') : c.total);
-    const tendered = num($tin.val());
-    const diff = round2(tendered - c.total);
-    let cls = 'success'; let msg;
-    if (diff >= 0) msg = sale ? `Change: <b>${cur()} ${fmtNum(diff)}</b>` : (diff > 0 ? '<b>Paid amount exceeds total</b>' : 'Fully paid');
-    else if (st.partyId) { cls = 'warning'; msg = `${sale ? 'Balance due' : 'Payable'}: <b>${cur()} ${fmtNum(-diff)}</b> (added to ${sale ? 'customer' : 'supplier'} account)`; }
-    else { cls = 'danger'; msg = `Short by ${cur()} ${fmtNum(-diff)}. Select a ${sale ? 'customer' : 'supplier'} for credit.`; }
-    if (!sale && diff > 0) cls = 'danger';
-    $m.find('.co-result').attr('class', `alert alert-${cls} py-2 mb-2 co-result`).html(msg);
-    $m.find('.co-complete').prop('disabled', cls === 'danger');
-    const quick = new Set([c.total]);
-    if (sale) [10, 50, 100, 500, 1000, 5000].forEach((u) => { const v = Math.ceil(c.total / u) * u; if (v > c.total && quick.size < 5) quick.add(v); });
-    $m.find('.pay-quick').html([...quick].map((v, i) => `<button type="button" class="btn btn-outline-primary" data-v="${v}">${i === 0 ? 'Exact' : fmtNum(v)}</button>`).join('')
-      + (st.partyId ? `<button type="button" class="btn btn-outline-secondary" data-v="0">${sale ? 'Credit' : 'Unpaid'}</button>` : ''));
+  if (!v) return;
+  addLine({ kind: 'cyl', typeId, name: t.name, out: v.n, in: v.take ? v.n : 0, rate: t.price });
+}
+
+function qtyField(label, value) {
+  return `<label class="form-label fw-semibold">${esc(label)}</label>
+    <input type="number" class="form-control form-control-lg text-center fw-bold" name="qty" min="1" step="1" inputmode="numeric" value="${value}">`;
+}
+
+async function addAccessory(itemId) {
+  const it = stockView.items.find((i) => i.id === itemId);
+  if (!it) return;
+  if (it.stock <= 0) UI.toast(`${it.name} is out of stock`, 'warning');
+  addLine({ kind: 'item', itemId, name: it.name, qty: 1, rate: it.salePrice });
+  root.querySelector('#pos-q').value = '';
+  renderAccessoryResults('');
+}
+
+function renderAccessoryResults(q) {
+  const box = root.querySelector('#pos-acc');
+  const qq = lc(q);
+  if (!qq) { box.innerHTML = ''; return; }
+  const hits = stockView.items.filter((i) => i.nameLc.includes(qq) || (i.barcode && i.barcode === q.trim()) || (i.sku || '').toLowerCase() === qq).slice(0, 8);
+  box.innerHTML = hits.length ? hits.map((i) => `<button type="button" class="acc-hit" data-acc="${esc(i.id)}">
+      <span class="flex-grow-1 min-w-0 text-start"><span class="d-block fw-medium text-truncate">${esc(i.name)}</span>
+      <span class="small text-body-secondary">${esc(cur())} ${f2(i.salePrice)} · ${fmtQty(i.stock)} in stock</span></span>
+      <i class="bi bi-plus-circle-fill text-primary"></i></button>`).join('')
+    : '<div class="small text-body-secondary p-2">No accessory matches that search.</div>';
+}
+
+// ---------- Customer choice ----------
+async function searchCustomers(q) {
+  const [list, dues] = await Promise.all([read(['customers'], (t) => t.getAll('customers')), Gas.partyDues()]);
+  const qq = lc(q);
+  return list
+    .filter((c) => !qq || c.nameLc.includes(qq) || (c.phone || '').includes(q.trim()))
+    .sort((a, b) => a.nameLc.localeCompare(b.nameLc)).slice(0, 60)
+    .map((c) => {
+      const d = round2(dues.get(c.id) || 0);
+      return { id: c.id, title: c.name, subtitle: c.phone || '', right: d > 0.004 ? `Due ${cur()} ${f2(d)}` : '', value: c };
+    });
+}
+
+async function chooseCustomer() {
+  const r = await UI.pick({
+    title: 'Choose customer', placeholder: 'Search name or phone', noneLabel: 'Walk-in customer (no name)',
+    search: searchCustomers,
+    addNew: { label: 'Add new customer', create: async () => { const c = await openPartyForm('customer'); return c ? { value: c } : undefined; } },
+  });
+  if (r === undefined) return;
+  state.customer = r === null ? null : { id: r.value.id, name: r.value.name };
+  if (!state.customer && totals().due > 0.004) UI.toast('Walk-in sales must be paid in full.', 'warning');
+  renderCustomer(); saveDraft();
+}
+
+// ---------- Save ----------
+async function save({ print }) {
+  const t = totals();
+  if (!state.lines.length) return;
+  const btn = root.querySelector(print ? '#pos-save-print' : '#pos-save');
+  btn.disabled = true;
+  try {
+    const bill = await Gas.saveSale({
+      customerId: state.customer?.id || null, lines: state.lines, discount: t.disc,
+      paid: t.paid, method: state.method, date: today(),
+    });
+    state = freshState();
+    saveDraft();
+    await loadStock();
+    refreshAll(); renderTiles(); renderAccessoryResults('');
+    if (print || getSettings().autoPrint) printHtml(receiptHtml(bill), bill.number);
+    doneModal(bill);
+  } catch (e) {
+    UI.toastError(e);
+  } finally { renderSummary(); }
+}
+
+function doneModal(bill) {
+  const due = bill.due > 0.004;
+  const m = UI.modal({
+    title: 'Sale saved', fullscreenMobile: false, scrollable: false,
+    body: `<div class="done-wrap">
+      <svg class="done-check" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="24"/><path d="M15 27l7 7 15-16"/></svg>
+      <div class="fw-bold fs-5 mt-2">${esc(bill.number)}</div>
+      <div class="text-body-secondary">${esc(bill.customerName)} · ${fmtDate(bill.date)}</div>
+      <div class="display-6 fw-bold mt-2">${esc(cur())} ${f2(bill.total)}</div>
+      ${due ? `<span class="badge text-bg-warning mt-2">Balance ${esc(cur())} ${f2(bill.due)} on credit</span>` : '<span class="badge text-bg-success mt-2">Paid in full</span>'}
+    </div>`,
+    footer: `<button class="btn btn-light" data-bs-dismiss="modal">New sale</button>
+      <button class="btn btn-primary btn-print"><i class="bi bi-printer me-1"></i>Print receipt</button>`,
+  });
+  m.$el.find('.btn-print').on('click', () => printHtml(receiptHtml(bill), bill.number));
+}
+
+async function loadStock() {
+  const snap = await read(['meta', 'cylStock', 'items'], async (t) => ({
+    gasKg: num((await t.get('meta', 'gasKg'))?.value),
+    cyl: await t.getAll('cylStock'),
+    items: await t.getAll('items'),
+  }));
+  stockView = {
+    gasKg: snap.gasKg,
+    cyl: snap.cyl,
+    items: snap.items.filter((i) => i.active !== false).map((i) => ({ ...i, nameLc: i.nameLc || lc(i.name) })),
   };
-  $m.on('input', '[name=discount]', update);
-  $m.on('input', '[name=tendered]', () => { tenderedTouched = true; update(); });
-  $m.on('click', '.pay-quick [data-v]', function () { tenderedTouched = true; $m.find('[name=tendered]').val(this.dataset.v); update(); });
-  $m.on('click', '.co-pct', () => {
-    const base = Posting.previewDoc(st.lines, 0, 0)?.subtotal || 0;
-    const pct = prompt('Discount percent (%)', '');
-    if (pct !== null && num(pct) >= 0 && num(pct) <= 100) { $m.find('[name=discount]').val(round2(base * num(pct) / 100)); update(); }
+}
+
+// ---------- Page ----------
+export async function render(el, { setTitle }) {
+  setTitle('Counter Sale');
+  state = { ...freshState(), ...(pref.get(DRAFT, null) || {}) };
+  state.lines = Array.isArray(state.lines) ? state.lines : [];
+  el.innerHTML = `
+  <div class="pos anim-rise">
+    <div class="pos-grid">
+      <section class="pos-tiles">
+        <div class="pos-top card-lift">
+          <button type="button" class="pos-customer" id="pos-customer" aria-label="Choose customer"></button>
+        </div>
+
+        <div class="section-title"><i class="bi bi-fire text-flame"></i> Refill customer's cylinder <span class="ms-auto small fw-normal" id="pos-tank"></span></div>
+        <div class="tile-grid" id="pos-refill"></div>
+
+        <div class="section-title mt-3"><i class="bi bi-arrow-left-right"></i> Swap cylinder (full out, empty in)</div>
+        <div class="tile-grid" id="pos-swap"></div>
+
+        <div class="section-title mt-3"><i class="bi bi-bag"></i> Accessories</div>
+        <div class="search-box"><i class="bi bi-search"></i>
+          <input type="search" id="pos-q" class="form-control" placeholder="Search or scan barcode" autocomplete="off" enterkeyhint="search"></div>
+        <div id="pos-acc" class="acc-list"></div>
+      </section>
+
+      <aside class="pos-cart card-lift">
+        <div class="cart-head d-flex align-items-center">
+          <div class="fw-bold fs-5">Bill</div>
+          <span class="badge rounded-pill text-bg-light border ms-2" id="pos-count"></span>
+          <button type="button" class="btn btn-link btn-sm text-danger ms-auto p-0" id="pos-clear">Clear</button>
+        </div>
+        <div class="cart-lines" id="pos-lines"></div>
+
+        <div class="cart-sum">
+          <div class="sum-row"><span>Subtotal</span><span id="pos-sub"></span></div>
+          <div class="sum-row"><span>Discount</span>
+            <input type="number" min="0" step="0.01" inputmode="decimal" class="form-control form-control-sm sum-input" id="pos-discount" placeholder="0"></div>
+          <div class="sum-total"><span>Total</span><span id="pos-total" class="fw-bold"></span></div>
+          <div class="sum-row"><span>Received
+              <button type="button" class="btn btn-link btn-sm p-0 ms-1 d-none" id="pos-paid-full">Full</button></span>
+            <input type="number" min="0" step="0.01" inputmode="decimal" class="form-control form-control-sm sum-input" id="pos-paid"></div>
+          <div class="d-flex justify-content-between align-items-center mt-2"><span class="small text-body-secondary">Balance</span><span id="pos-due" class="badge rounded-pill"></span></div>
+          <div class="btn-group w-100 mt-3 method-seg" role="group" aria-label="Payment method">
+            <button type="button" class="btn btn-outline-secondary" data-method="cash"><i class="bi bi-cash me-1"></i>Cash</button>
+            <button type="button" class="btn btn-outline-secondary" data-method="bank"><i class="bi bi-bank me-1"></i>Bank / wallet</button>
+          </div>
+          <div class="d-grid gap-2 mt-3">
+            <button type="button" class="btn btn-grad btn-lg" id="pos-save"><i class="bi bi-check2-circle me-1"></i>Save sale</button>
+            <button type="button" class="btn btn-outline-primary" id="pos-save-print"><i class="bi bi-printer me-1"></i>Save &amp; print receipt</button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>`;
+  root = el;
+
+  await loadStock();
+  renderTiles();
+  refreshAll();
+  renderSummary();
+
+  const $r = window.jQuery(el);
+  $r.on('click', '[data-refill]', (e) => addRefill(e.currentTarget.dataset.refill));
+  $r.on('click', '[data-swap]', (e) => addSwap(e.currentTarget.dataset.swap));
+  $r.on('click', '#pos-customer', chooseCustomer);
+  $r.on('input', '#pos-q', (e) => renderAccessoryResults(e.currentTarget.value));
+  $r.on('keydown', '#pos-q', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    const q = e.currentTarget.value.trim();
+    const exact = stockView.items.find((i) => i.barcode && i.barcode === q);
+    const first = stockView.items.find((i) => i.nameLc.includes(lc(q)));
+    const hit = exact || first;
+    if (hit) addAccessory(hit.id);
   });
-  $m.on('click', '.co-party', async () => {
-    m.bs.hide(); await new Promise((r) => $m.one('hidden.bs.modal', r));
-    await choosePartyFn(); m.bs.show(); tenderedTouched = false; update();
-  });
-  // Our modal helper removes the element on hide; keep it alive while choosing a party.
-  $m.off('hidden.bs.modal');
-  let finished = false;
-  const closeAll = () => { finished = true; m.bs.hide(); $m.one('hidden.bs.modal', () => { m.bs.dispose(); $m.remove(); }); };
-  $m.find('[data-bs-dismiss=modal]').on('click', (e) => { e.preventDefault(); closeAll(); });
-  $m.find('.btn-close').on('click', (e) => { e.preventDefault(); closeAll(); });
-  $m.on('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); closeAll(); } });
-  $m.find('form').on('submit', (e) => { e.preventDefault(); $m.find('.co-complete').trigger('click'); });
-  $m.on('shown.bs.modal', () => { if (!finished) $m.find('[name=tendered]').trigger('select'); });
-
-  let busy = false;
-  $m.find('.co-complete').on('click', async function () {
-    if (busy) return; busy = true;
-    const $b = $(this).prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Saving…');
-    $m.find('.co-error').addClass('d-none');
-    try {
-      const account = $m.find('[name=account]').val();
-      pref.set('payAccount', account);
-      st.discount = num($m.find('[name=discount]').val());
-      st.note = $m.find('[name=note]').val() || '';
-      if (canDate) st.date = $m.find('[name=date]').val() || today();
-      if (!sale) st.refNo = $m.find('[name=refNo]').val() || '';
-      const input = {
-        id: st.id, editId: st.editId, date: st.date, items: st.lines, discount: st.discount, taxRate: taxRate(),
-        tendered: num($m.find('[name=tendered]').val()), paymentAccountId: account, note: st.note, refNo: st.refNo,
-        customerId: sale ? st.partyId : undefined, supplierId: sale ? undefined : st.partyId,
-      };
-      const { doc, duplicate } = sale ? await Posting.saveSale(input) : await Posting.savePurchase(input);
-      const doPrint = sale && $m.find('#co-print').prop('checked');
-      closeAll();
-      const wasEdit = !!st.editId;
-      localStorage.removeItem(draftKey());
-      st = fresh(st.mode);
-      if (wasEdit) { location.hash = `#/${sale ? 'sales' : 'purchases'}/${doc.id}`; UI.toast(`${doc.number} updated`); return; }
-      $root.html(layout()); renderLines(); renderHoldCount();
-      UI.toast(duplicate ? `${doc.number} was already saved` : `${doc.number} saved — ${cur()} ${fmtNum(doc.total)}`);
-      if (doPrint) await Printer.printDocument('sale', doc, { silentFail: true });
-      afterSave(doc);
-    } catch (err) {
-      console.warn(err);
-      $m.find('.co-error').text(err.message || String(err)).removeClass('d-none');
-      $b.prop('disabled', false).html(`<i class="bi bi-check2-circle me-1"></i>${sale ? 'Complete sale' : 'Save purchase'}`);
-    } finally { busy = false; }
-  });
-  update();
-}
-
-function afterSave(doc) {
-  const sale = isSale();
-  const m = UI.modal({
-    title: sale ? 'Sale completed' : 'Purchase saved', fullscreenMobile: false, scrollable: false,
-    body: `<div class="text-center"><i class="bi bi-check-circle-fill text-success display-5"></i>
-      <div class="h5 mt-2 mb-0">${esc(doc.number)}</div><div class="text-body-secondary">${cur()} ${fmtNum(doc.total)}</div>
-      ${doc.change ? `<div class="alert alert-success mt-3 mb-0 py-2 fs-5">Change: <b>${cur()} ${fmtNum(doc.change)}</b></div>` : ''}
-      ${doc.balance ? `<div class="alert alert-warning mt-3 mb-0 py-2">Balance due: <b>${cur()} ${fmtNum(doc.balance)}</b></div>` : ''}</div>`,
-    footer: `<button class="btn btn-outline-secondary btn-print"><i class="bi bi-printer me-1"></i>Print</button>
-      <a class="btn btn-outline-secondary" href="#/${sale ? 'sales' : 'purchases'}/${doc.id}"><i class="bi bi-eye me-1"></i>View</a>
-      <button class="btn btn-primary flex-grow-1" data-bs-dismiss="modal">New ${sale ? 'sale' : 'purchase'}</button>`,
-  });
-  m.$el.find('.btn-print').on('click', () => Printer.printDocument(sale ? 'sale' : 'purchase', doc));
-  m.$el.find('a').on('click', () => m.close());
-  m.closed.then(() => $root?.find('.pos-q').trigger('focus'));
-}
-
-// ---------- holds ----------
-async function holdSale() {
-  if (!st.lines.length) return UI.toast('Cart is empty', 'warning');
-  await Posting.saveHold({ id: uuid(), label: st.partyName || `Sale ${new Date().toLocaleTimeString()}`, state: { ...st }, total: totals().total });
-  localStorage.removeItem(draftKey());
-  st = fresh('sale');
-  renderLines(); renderHoldCount();
-  UI.toast('Sale held');
-}
-async function showHolds() {
-  const holds = (await idb.getAll('holds')).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  if (!holds.length) return UI.toast('No held sales', 'info');
-  const picked = await UI.pick({ title: 'Held sales', search: async (q) => holds.filter((h) => h.label.toLowerCase().includes(q.toLowerCase())).map((h) => ({ id: h.id, title: h.label, subtitle: `${h.state.lines.length} item(s) · ${new Date(h.createdAt).toLocaleString()}`, right: fmtNum(h.total), value: h })) });
-  if (!picked) return;
-  if (st.lines.length && !await UI.confirmDialog('Replace the current cart with the held sale? (Hold the current cart first if you need it.)')) return;
-  st = { ...fresh('sale'), ...picked.value.state, id: uuid(), editId: null };
-  // The resumed cart is now the (persisted) active draft; remove it from the held list so it cannot be resumed twice.
-  await Posting.deleteHold(picked.id);
-  renderLines(); renderHoldCount();
-}
-
-// ---------- quick product add ----------
-async function quickAdd(prefill = '') {
-  if (!Auth.can('product.edit')) return UI.toast('You do not have permission to add products', 'warning');
-  const { editProduct } = await import('./products.js');
-  const p = await editProduct(null, /^\d{6,}$/.test(prefill) ? { barcode: prefill } : { name: prefill });
-  if (p) { addProduct(Catalog.product(p.id)); $root.find('.pos-q').val(''); hideResults(); }
-}
-
-// ---------- module ----------
-export default {
-  async render(el, { route, params, setTitle }) {
-    const mode = route === 'purchase' ? 'purchase' : 'sale';
-    await loadPayAccounts();
-    if (params[0] === 'edit' && params[1]) {
-      Auth.require(mode === 'sale' ? 'sale.edit' : 'purchase.manage');
-      const doc = await idb.get(mode === 'sale' ? 'sales' : 'purchases', params[1]);
-      if (!doc) throw new AppError('Document not found.');
-      if (doc.status === 'void') throw new AppError('Voided documents cannot be edited.');
-      const items = (await idb.getAllByIndex(mode === 'sale' ? 'saleItems' : 'purchaseItems', mode === 'sale' ? 'saleId' : 'purchaseId', doc.id)).sort((a, b) => a.line - b.line);
-      st = { ...fresh(mode), id: doc.id, editId: doc.id, editNumber: doc.number, date: doc.date, partyId: doc.customerId || doc.supplierId || null,
-        partyName: doc.customerId ? doc.customerName : doc.supplierId ? doc.supplierName : '', discount: doc.discount, note: doc.note || '', refNo: doc.refNo || '',
-        tendered: mode === 'sale' ? doc.tendered : doc.paid, taxRate: doc.taxRate || 0, payAccount: doc.paymentAccountId,
-        lines: items.map((i) => ({ productId: i.productId, name: i.name, unit: i.unit, qty: i.qty, rate: i.rate, discount: i.discount })) };
-      setTitle(`Edit ${doc.number}`);
-    } else {
-      st = fresh(mode);
-      try { const d = JSON.parse(localStorage.getItem(storageKey('draft.' + mode)) || 'null'); if (d && d.mode === mode && !d.editId) st = { ...st, ...d }; } catch { /* ignore */ }
-      if (st.date !== today()) st.date = today();
+  $r.on('click', '[data-acc]', (e) => addAccessory(e.currentTarget.dataset.acc));
+  $r.on('click', '[data-step]', (e) => {
+    const b = e.currentTarget;
+    const i = +b.dataset.step; const field = b.dataset.field; const d = +b.dataset.d;
+    const l = state.lines[i]; if (!l) return;
+    const next = Math.max(0, (l[field] || 0) + d);
+    if (l.kind === 'refill' && field === 'qty') {
+      if (next === 0) return removeLine(i);
+      const inCart = refillKgExcept(i) + next * (cylinderType(l.typeId)?.kg || 0);
+      if (inCart > stockView.gasKg) return UI.toast('Not enough gas in the tank.', 'warning');
     }
-    $root = $(el);
-    $root.html(layout());
-    renderLines(); renderHoldCount(); renderGrid();
-    const $q = $root.find('.pos-q');
-    if (window.matchMedia('(min-width: 992px)').matches) $q.trigger('focus');
+    if (l.kind === 'cyl' && field === 'out' && next > fullInStock(l.typeId) - outInCartExcept(i, l.typeId)) {
+      return UI.toast('No more full cylinders in stock.', 'warning');
+    }
+    if (l.kind !== 'cyl' && next === 0) return removeLine(i);
+    l[field] = next;
+    if (l.kind === 'cyl' && l.out === 0 && l.in === 0) return removeLine(i);
+    refreshAll();
+  });
+  $r.on('change', '[data-rate]', (e) => {
+    const l = state.lines[+e.currentTarget.dataset.rate]; if (!l) return;
+    l.rate = round2(Math.max(0, num(e.currentTarget.value)));
+    refreshAll();
+  });
+  $r.on('click', '[data-remove]', (e) => removeLine(+e.currentTarget.dataset.remove));
+  $r.on('click', '#pos-clear', async () => {
+    if (!state.lines.length && !state.customer) return;
+    if (!await UI.confirmDialog('Clear this bill? The items will be removed.', { okLabel: 'Clear bill', okClass: 'btn-danger' })) return;
+    state = freshState(); saveDraft(); refreshAll(); renderSummary();
+  });
+  $r.on('change', '#pos-discount', (e) => { state.discount = Math.max(0, round2(num(e.currentTarget.value))); renderSummary(); });
+  $r.on('change', '#pos-paid', (e) => {
+    const v = e.currentTarget.value;
+    state.paid = v === '' ? 0 : Math.max(0, round2(num(v)));
+    renderSummary();
+  });
+  $r.on('click', '#pos-paid-full', () => { state.paid = null; renderSummary(); });
+  $r.on('click', '[data-method]', (e) => { state.method = e.currentTarget.dataset.method; renderSummary(); });
+  $r.on('click', '#pos-save', () => save({ print: false }));
+  $r.on('click', '#pos-save-print', () => save({ print: true }));
+}
 
-    $root.on('input', '.pos-q', doSearch);
-    $root.on('keydown', '.pos-q', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        const q = $q.val().trim();
-        if (!q) return;
-        const exact = Catalog.findByCode(q);
-        if (exact) { addProduct(exact); UI.beep(); }
-        else { const r = Catalog.searchProducts(q, { limit: 2 }); if (r.length) addProduct(r[0]); else { UI.toast(`No product found for "${q}"`, 'warning'); return; } }
-        $q.val(''); hideResults();
-      } else if (e.key === 'Escape') { $q.val(''); hideResults(); }
-    });
-    $root.on('click', '.search-results [data-i]', function () { addProduct(results[+this.dataset.i]); $q.val(''); hideResults(); $q.trigger('focus'); });
-    $root.on('click', '.quick-add-link', (e) => { e.preventDefault(); quickAdd($q.val().trim()); });
-    $(document).on('click.posres', (e) => { if (!$(e.target).closest('.pos-search').length) hideResults(); });
+function removeLine(i) {
+  state.lines.splice(i, 1);
+  refreshAll();
+}
 
-    $root.on('click', '.btn-inc, .btn-dec', function () {
-      const i = +$(this).closest('.cart-line').data('i');
-      const l = st.lines[i];
-      const q = round3(l.qty + ($(this).hasClass('btn-inc') ? 1 : -1));
-      if (q <= 0) st.lines.splice(i, 1); else l.qty = q;
-      renderLines();
-    });
-    $root.on('change', '.qty-in', function () {
-      const i = +$(this).closest('.cart-line').data('i');
-      const q = round3(num(this.value));
-      if (q > 0) st.lines[i].qty = q; else st.lines.splice(i, 1);
-      renderLines();
-    });
-    $root.on('focus', '.qty-in', function () { this.select(); });
-    $root.on('click keydown', '.btn-line', function (e) { if (e.type === 'keydown' && e.key !== 'Enter') return; editLine(+$(this).closest('.cart-line').data('i')); });
-    $root.on('click', '.btn-pay', checkout);
-    $root.on('click', '.btn-party', choosePartyFn);
-    $root.on('click', '.btn-clear', async () => {
-      if (st.editId) { if (await UI.confirmDialog('Discard changes to this document?')) history.back(); return; }
-      if (st.lines.length && !await UI.confirmDialog('Clear all items from the cart?', { okLabel: 'Clear', okClass: 'btn-danger' })) return;
-      st = fresh(st.mode); renderLines();
-    });
-    $root.on('click', '.btn-hold', holdSale);
-    $root.on('click', '.btn-holds', showHolds);
-    $root.on('click', '.btn-price-mode', () => { st.priceMode = st.priceMode === 'retail' ? 'wholesale' : 'retail'; pref.set('priceMode', st.priceMode); UI.toast(`Using ${st.priceMode} prices for new items`, 'info'); renderTotals(); renderGrid(); });
-    $root.on('click', '.btn-quick-add', () => quickAdd(''));
-    $root.on('click', '.btn-scan', async () => { const code = await Scanner.scan(); if (code) addByCode(code); });
-    $root.on('click', '.btn-scan-cont', () => Scanner.scan({ continuous: true, title: 'Continuous scan', onCode: addByCode }));
-    $root.on('click', '.btn-browse', () => { $root.find('.pos').addClass('show-browse'); renderGrid(); });
-    $root.on('click', '.btn-close-browse', () => $root.find('.pos').removeClass('show-browse'));
-    $root.on('input', '.browse-q', debounce(renderGrid, 150));
-    $root.on('click', '.cat-chips [data-cat]', function () { browseCat = this.dataset.cat || null; renderGrid(); });
-    $root.on('click', '.product-tile', function () {
-      addProduct(Catalog.product(this.dataset.id));
-      if (!window.matchMedia('(min-width: 992px)').matches) UI.toast('Added', 'success', 800);
-    });
-    detachWedge = Scanner.attachWedge(addByCode);
-  },
-  destroy() {
-    detachWedge?.(); detachWedge = null;
-    $(document).off('click.posres');
-    $root?.off(); $root = null;
-  },
-};
+// Stock already promised to other cart lines (so two lines cannot together exceed what is in stock).
+function refillKgExcept(skip) {
+  return state.lines.reduce((a, l, i) => (i !== skip && l.kind === 'refill' ? a + lineKg(l) : a), 0);
+}
+function outInCartExcept(skip, typeId) {
+  return state.lines.reduce((a, l, i) => (i !== skip && l.kind === 'cyl' && l.typeId === typeId ? a + l.out : a), 0);
+}
+function fullInStock(typeId) {
+  return stockView.cyl.find((c) => c.id === typeId)?.full || 0;
+}
